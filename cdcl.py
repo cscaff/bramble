@@ -35,14 +35,14 @@ loading), never a wrong answer.
 from amaranth import Array, Cat, Const, Elaboratable, Module, Mux, Signal, signed
 from amaranth.lib.memory import Memory
 
-VB = 12                  # variable index bits: up to 4096 variables
+VB = 11                  # variable index bits: up to NV - 1 = 2047 variables (so depth-NV memories suffice)
 NV = 1 << VB
 LB = VB + 1              # literal bits
 AAW = 15                 # arena address bits
 ARENA = 1 << AAW         # literal slots, headers included
-WAW = 15                 # watch node address bits (two per long clause)
+WAW = 14                 # watch node address bits (two per long clause): 8K long clauses
 WN = 1 << WAW
-BAW = 15                 # binary node address bits (two per binary clause)
+BAW = 13                 # binary node address bits (two per binary clause): 4K binary clauses
 BN = 1 << BAW
 LMAX = 1024              # longest learned clause
 NIL_W = (1 << WAW) - 1   # end of a watch list (node WN-1 is never allocated)
@@ -108,18 +108,17 @@ class Cdcl(Elaboratable):
         val_r, val_w = mem(m, "val", 2, NV)
         lvl_r, lvl_w = mem(m, "level", VB + 1, NV)
         rsn_r, rsn_w = mem(m, "reason", RW, NV)
-        tr_r, tr_w = mem(m, "trail", LB, NV + 1)
-        tl_r, tl_w = mem(m, "trail_lim", VB + 1, NV + 1)
+        tr_r, tr_w = mem(m, "trail", LB, NV)
+        tl_r, tl_w = mem(m, "trail_lim", VB + 1, NV)
         sav_r, sav_w = mem(m, "saved", 1, NV)
         seen_r, seen_w = mem(m, "seen", 2, NV)          # 1: in the clause / analysed, 2: shown redundant
         sk_r, sk_w = mem(m, "mstack", LB, NV)               # minimization: DFS stack
         tc_r, tc_w = mem(m, "tclear", VB, NV)               # minimization: variables marked 2
-        ls_r, ls_w = mem(m, "lstamp", 32, NV + 1)           # LBD: the conflict that last counted a level
+        ls_r, ls_w = mem(m, "lstamp", 16, NV)           # LBD: the conflict that last counted a level (low 16 bits)
         stm_r, stm_w = mem(m, "stamp_ld", 18, NV)         # loading: (clause no., pos seen, neg seen)
         pv_r, pv_w = mem(m, "vprev", VB + 1, NV)
         nx_r, nx_w = mem(m, "vnext", VB + 1, NV)
         st_r, st_w = mem(m, "vstamp", 32, NV)
-        st2_r = m.submodules["vstamp"].read_port()          # a second read port: the search pointer's stamp
         lb_r, lb_w = mem(m, "lbuf", LB, LMAX)
         an_r, an_w = mem(m, "ana", VB, NV)
         hi_r, hi_w = mem(m, "hist", AAW + 1, 256)
@@ -204,6 +203,7 @@ class Cdcl(Elaboratable):
         y = Signal(LB)
         u = Signal(VB + 1)                  # undo index into tclear
         curlvl = Signal(VB + 1)
+        bt_stamp = Signal(32)
         # LBD, restarts
         lbd = Signal(8)
         ema_fast = Signal(signed(34))       # fixed point, 16 fraction bits
@@ -275,14 +275,14 @@ class Cdcl(Elaboratable):
                 m.d.comb += [self.load_ready.eq(1), self.idle.eq(1)]
                 with m.If(self.start | start_pending):
                     m.d.sync += [n.eq(self.nvars[:VB + 1]), i.eq(0), start_pending.eq(0),
-                                 reject.eq(reject | (self.nvars > NV))]
+                                 reject.eq(reject | (self.nvars >= NV))]
                     m.next = "VMTF_INIT"
                 with m.Elif(self.load_valid):
                     with m.If(d == 0):
                         m.next = "CL_END"
                     with m.Elif(cl_drop | reject):
                         pass
-                    with m.Elif((a > NV) | (a > self.nvars)):
+                    with m.Elif((a >= NV) | (a > self.nvars)):
                         m.d.sync += reject.eq(1)
                     with m.Else():
                         m.d.sync += lit.eq(dlit)
@@ -769,7 +769,7 @@ class Cdcl(Elaboratable):
             with m.State("AN_CLEAR_RD"):
                 with m.If(i == nana):
                     m.d.sync += [i.eq(1), bmax.eq(1), bmaxlvl.eq(0), lbd.eq(1)]
-                    m.d.comb += [ls_w.addr.eq(dl), ls_w.data.eq(self.conflicts), ls_w.en.eq(1)]
+                    m.d.comb += [ls_w.addr.eq(dl), ls_w.data.eq(self.conflicts[:16]), ls_w.en.eq(1)]
                     m.next = "BT_FIND_RD"
                 with m.Else():
                     m.d.comb += an_r.addr.eq(i)
@@ -842,8 +842,8 @@ class Cdcl(Elaboratable):
                 m.d.comb += ls_r.addr.eq(lvl_r.data)
                 m.next = "BT_LSTAMP"
             with m.State("BT_LSTAMP"):          # a level not counted yet for this conflict
-                with m.If(ls_r.data != self.conflicts):
-                    m.d.comb += [ls_w.addr.eq(curlvl), ls_w.data.eq(self.conflicts), ls_w.en.eq(1)]
+                with m.If(ls_r.data != self.conflicts[:16]):
+                    m.d.comb += [ls_w.addr.eq(curlvl), ls_w.data.eq(self.conflicts[:16]), ls_w.en.eq(1)]
                     with m.If(lbd != 255):
                         m.d.sync += lbd.eq(lbd + 1)
                 m.d.sync += i.eq(i + 1)
@@ -884,12 +884,16 @@ class Cdcl(Elaboratable):
                 v_ = var(tr_r.data)
                 m.d.comb += [val_w.addr.eq(v_), val_w.data.eq(0), val_w.en.eq(1),
                              sav_w.addr.eq(v_), sav_w.data.eq(tr_r.data[0]), sav_w.en.eq(1),
-                             st_r.addr.eq(v_), st2_r.addr.eq(vsearch[:VB])]
+                             st_r.addr.eq(v_)]
                 m.d.sync += [tlen.eq(tlen - 1), bump_v.eq(v_)]
                 m.next = "BT_STAMP"
-            with m.State("BT_STAMP"):
+            with m.State("BT_STAMP"):            # one read port: the freed variable's stamp, then the pointer's
+                m.d.sync += bt_stamp.eq(st_r.data)
+                m.d.comb += st_r.addr.eq(vsearch[:VB])
+                m.next = "BT_CMP"
+            with m.State("BT_CMP"):
                 # the search pointer moves to the freed variable if it is later in the queue
-                with m.If((vsearch == NIL_V) | (st_r.data > st2_r.data)):
+                with m.If((vsearch == NIL_V) | (bt_stamp > st_r.data)):
                     m.d.sync += vsearch.eq(bump_v)
                 m.next = "BT_RD"
 

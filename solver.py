@@ -25,6 +25,8 @@ Later stages add the CDCL core and the local-search engine around this front end
 from amaranth import Array, Cat, Const, Elaboratable, Module, Mux, ResetInserter, Signal, signed
 from amaranth.lib.memory import Memory
 
+import cdcl
+
 K = 7                 # widest clause considered part of an XOR
 VB = 9                # variable index bits: columns 0..511
 C = 1 << VB           # Gauss columns (variables)
@@ -51,12 +53,8 @@ def parity_select(k, par):
     return sum(1 << i for i in range(1 << k) if bin(i).count("1") % 2 == par)
 
 
-class Solver(Elaboratable):
-    # The runner skips anything larger. Clause count and literal count are not limited by the hardware (longer
-    # clauses are skipped, a full table gives UNKNOWN), so they are declared generously.
-    max_vars = C
-    max_clauses = 1 << 20
-    max_lits = 1 << 22
+class GaussFront(Elaboratable):
+    """Stages 1-4 above. Answers UNSAT, or UNKNOWN for the CDCL core to take over; never SAT."""
 
     def __init__(self):
         # From the shell.
@@ -87,9 +85,7 @@ class Solver(Elaboratable):
         kr, kw = keys.read_port(), keys.write_port()
         mr, mw = masks.read_port(), masks.write_port()
         xr, xw = mat.read_port(), mat.write_port()
-        # small instances, kept whole: bit 5 end of clause, bit 4 negative, bits 0-3 variable - 1
-        m.submodules.small = small = Memory(shape=6, depth=BF_WORDS, init=[])
-        br, bw = small.read_port(), small.write_port()
+
 
         # ---------------------------------------------------------------- clause being loaded (sorted)
         cnt = Signal(range(K + 1))
@@ -140,17 +136,9 @@ class Solver(Elaboratable):
         rows_full = Signal()
         too_wide = Signal()
         clr = Signal(EB + 1)
-        bf_ok = Signal()                                 # the instance is small enough to keep whole
-        bf_n = Signal(range(BF_WORDS + 1))
-        bf_i = Signal(range(BF_WORDS + 1))
-        bf_a = Signal(BF_VARS + 1)                       # the assignment being tried
-        bf_csat = Signal()
-        sat = Signal()
-        brute = Signal()
 
-        m.d.comb += self.rejected.eq(0)
-        # the model: the assignment that satisfied every clause (registered: read one cycle after model_addr)
-        m.d.sync += self.model_val.eq(sat & bf_a.bit_select(self.model_addr[:4], 1))
+
+        m.d.comb += [self.rejected.eq(0), self.model_val.eq(0)]
 
         # literal arriving
         d = self.load_data
@@ -182,7 +170,7 @@ class Solver(Elaboratable):
                 m.d.comb += self.idle.eq(1)
                 with m.If(clr == E):
                     m.d.sync += [cnt.eq(0), drop.eq(0), rows.eq(0), table_full.eq(0), rows_full.eq(0),
-                                 unsat.eq(0), too_wide.eq(0), bf_ok.eq(1), bf_n.eq(0), sat.eq(0), brute.eq(0)]
+                                 unsat.eq(0), too_wide.eq(0)]
                     m.next = "READY"
                 with m.Else():
                     m.d.comb += [kw.addr.eq(clr[:EB]), kw.data.eq(0), kw.en.eq(1)]
@@ -195,12 +183,6 @@ class Solver(Elaboratable):
                     m.d.sync += [start_pending.eq(0), e.eq(0), too_wide.eq(self.nvars > C)]
                     m.next = "SCAN_RD"
                 with m.Elif(self.load_valid):
-                    with m.If(bf_ok):
-                        with m.If((bf_n == BF_WORDS) | ((d != 0) & (a > BF_VARS))):
-                            m.d.sync += bf_ok.eq(0)
-                        with m.Else():
-                            m.d.comb += [bw.addr.eq(bf_n), bw.data.eq(Cat(lv[:4], lneg, d == 0)), bw.en.eq(1)]
-                            m.d.sync += bf_n.eq(bf_n + 1)
                     with m.If(d == 0):
                         with m.If(~drop & (cnt != 0)):
                             # probe for insertion
@@ -395,7 +377,7 @@ class Solver(Elaboratable):
             # ------------------------------------------------------------ an all-zero row with rhs 1?
             with m.State("CHECK_RD"):
                 with m.If(r == rows):
-                    m.next = "BF_START"
+                    m.next = "FINISH"
                 with m.Else():
                     m.d.comb += xr.addr.eq(r)
                     m.next = "CHECK"
@@ -407,41 +389,64 @@ class Solver(Elaboratable):
                     m.d.sync += r.eq(r + 1)
                     m.next = "CHECK_RD"
 
-            # ------------------------------------------------------------ small instances: try every assignment
-            with m.State("BF_START"):
-                with m.If(bf_ok & (self.nvars <= BF_VARS)):
-                    m.d.sync += [bf_a.eq(0), bf_i.eq(0), bf_csat.eq(0), brute.eq(1)]
-                    m.next = "BF_RD"
-                with m.Else():
-                    m.next = "FINISH"
-            with m.State("BF_RD"):
-                with m.If(bf_i == bf_n):
-                    m.d.sync += sat.eq(1)                     # every clause satisfied
-                    m.next = "FINISH"
-                with m.Else():
-                    m.d.comb += br.addr.eq(bf_i)
-                    m.next = "BF"
-            with m.State("BF"):
-                w = br.data
-                with m.If(w[5]):                                # end of a clause
-                    with m.If(~bf_csat):
-                        with m.If(bf_a + 1 == (Const(1, BF_VARS + 2) << self.nvars[:5])):
-                            m.d.sync += unsat.eq(1)             # no assignment satisfies it
-                            m.next = "FINISH"
-                        with m.Else():
-                            m.d.sync += [bf_a.eq(bf_a + 1), bf_i.eq(0)]
-                            m.next = "BF_RD"
-                    with m.Else():
-                        m.d.sync += [bf_csat.eq(0), bf_i.eq(bf_i + 1)]
-                        m.next = "BF_RD"
-                with m.Else():
-                    m.d.sync += [bf_csat.eq(bf_csat | (bf_a.bit_select(w[:4], 1) != w[4])), bf_i.eq(bf_i + 1)]
-                    m.next = "BF_RD"
-
             with m.State("FINISH"):
-                m.d.comb += [self.done.eq(1), self.result.eq(Mux(unsat, 2, Mux(sat, 1, 0))),
+                m.d.comb += [self.done.eq(1), self.result.eq(Mux(unsat, 2, 0)),
                              self.info.eq(rows | Mux(table_full, INFO_TABLE_FULL, 0) | Mux(rows_full, INFO_ROWS_FULL, 0)
-                                          | Mux(too_wide, INFO_TOO_WIDE, 0) | Mux(brute, INFO_BRUTE, 0) | INFO_GAUSS)]
+                                          | Mux(too_wide, INFO_TOO_WIDE, 0) | INFO_GAUSS)]
 
-        # abort: drop everything and clear the table again
+        return m
+
+
+class Solver(Elaboratable):
+    """The Gauss front end, then (if it proved nothing) the CDCL core, on the same clause stream."""
+    max_vars = cdcl.NV - 1
+    max_clauses = (1 << 16) - 1          # the loader's per-clause duplicate stamps are 16 bits
+    max_lits = cdcl.ARENA                # long clauses live in the arena (binaries and units do not)
+
+    def __init__(self):
+        self.start = Signal()
+        self.abort = Signal()
+        self.nvars = Signal(32)
+        self.nclauses = Signal(32)
+        self.nlits = Signal(32)
+        self.load_valid = Signal()
+        self.load_data = Signal(signed(32))
+        self.model_addr = Signal(32)
+        self.idle = Signal()
+        self.load_ready = Signal()
+        self.done = Signal()
+        self.rejected = Signal()
+        self.result = Signal(2)
+        self.info = Signal(32)
+        self.model_val = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.front = front = GaussFront()
+        m.submodules.core = core = cdcl.Cdcl()
+        both_ready = front.load_ready & core.load_ready
+        core_started = Signal()
+        m.d.comb += [
+            front.nvars.eq(self.nvars), front.nclauses.eq(self.nclauses), front.nlits.eq(self.nlits),
+            front.load_valid.eq(self.load_valid & both_ready), front.load_data.eq(self.load_data),
+            front.start.eq(self.start),
+            core.nvars.eq(self.nvars),
+            core.load_valid.eq(self.load_valid & both_ready), core.load_data.eq(self.load_data),
+            core.model_addr.eq(self.model_addr),
+            self.load_ready.eq(both_ready),
+            self.idle.eq(front.idle & core.idle),
+            self.model_val.eq(core.model_val),
+        ]
+        front_proved = front.done & (front.result == 2)
+        # the front end has finished without a proof: hand over to the core (once)
+        with m.If(front.done & ~front_proved & ~core_started):
+            m.d.comb += core.start.eq(1)
+            m.d.sync += core_started.eq(1)
+        with m.If(front_proved):
+            m.d.comb += [self.done.eq(1), self.result.eq(2), self.info.eq(front.info)]
+        with m.Elif(core.rejected):
+            m.d.comb += [self.rejected.eq(1), self.info.eq(core.info)]
+        with m.Elif(core.done):
+            m.d.comb += [self.done.eq(1), self.result.eq(core.result), self.info.eq(core.info | (front.info & 0xFFFF))]
+        # abort: both drop everything and start over
         return ResetInserter({"sync": self.abort})(m)
