@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the Bramble model on the public instances and score it like the competition (PAR-2 at the limit).
 
-  tools/bench.py NAME [--jobs=6] [--limit=300] [--only=ID,ID] -- [model options]
+  tools/bench.py NAME [--jobs=6] [--limit=300] [--only=ID,ID] [--bin=bramble] -- [model options]
 
 Writes results/NAME.tsv (id, known, result, simulated seconds, conflicts, P, how) and prints a summary.
 A SAT answer is checked against the clauses by the model itself (SAT_INVALID otherwise); an UNSAT answer is
@@ -30,7 +30,7 @@ def main():
     def one(r):
         iid = r[0]
         t = time.time()
-        p = subprocess.run([str(ROOT / "model" / "bramble"), str(ROOT / "bench" / f"{iid}.cnf"),
+        p = subprocess.run([str(ROOT / "model" / opts.get("bin", "bramble")), str(ROOT / "bench" / f"{iid}.cnf"),
                             f"--limit={limit}", *model_opts], capture_output=True, text=True, timeout=7200)
         line = (p.stdout.strip().splitlines() or [""])[-1].split()
         f = dict(zip(line[::2], line[1::2]))

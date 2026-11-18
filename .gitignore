@@ -3,3 +3,4 @@ bench/
 model/bramble
 results/
 __pycache__/
+model/bramble_*

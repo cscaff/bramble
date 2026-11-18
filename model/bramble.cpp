@@ -45,7 +45,8 @@ struct Config {
     int pipe = 3;                 // cycles of pipeline latency per propagated literal
     int ports = 2;                // value reads per cycle per partition (dual-port BRAM)
     u64 seed = 1;
-    long arena_words = 1 << 20;   // clause-bank capacity in literal slots (all partitions together)
+    long arena_words = 1 << 20;   // clause-bank capacity in literal slots (all partitions together), when bram=0
+    int bram = 0;                 // entry BRAM budget in DP16KD blocks (0: unlimited); the ECP5-85F has 208, the SoC uses 25
     bool verbose = false;
     bool gauss = true;            // XOR recovery + Gauss-Jordan before search
     int gauss_width = 8;          // longest clause considered part of an XOR
@@ -113,7 +114,7 @@ static bool read_dimacs(const char* path, Formula& f) {
 // elimination over GF(2) before search. An inconsistent row proves UNSAT; rows reduced to one or two variables give
 // units and equivalences for the CDCL core. Hardware: rows are bit vectors in BRAM borrowed from the (not yet used)
 // clause banks; one row-XOR costs one cycle per `gauss_word` bits.
-struct GaussResult { bool unsat = false; int xors = 0; int units = 0; int equivs = 0; u64 cycles = 0;
+struct GaussResult { bool unsat = false; int xors = 0; int units = 0; int equivs = 0; u64 cycles = 0; u64 cols = 0;
                      std::vector<std::vector<u32>> derived; };
 
 static GaussResult gauss(const Formula& f, int max_width, int word_bits) {
@@ -179,6 +180,7 @@ static GaussResult gauss(const Formula& f, int max_width, int word_bits) {
     for (auto& x : xs) for (u32 v : x.first) cols.push_back(v);
     std::sort(cols.begin(), cols.end()); cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
     size_t W = (cols.size() + 63) / 64;
+    R.cols = cols.size();
     u64 hw_words = (cols.size() + word_bits - 1) / word_bits;   // hardware words per row
     std::vector<Row> rows;
     for (auto& x : xs) {
@@ -394,6 +396,12 @@ struct Solver {
     std::vector<u32> arena;
     std::vector<u32> learned_refs;
     long arena_live = 0;   // literal slots in use (clauses not deleted)
+    long arena_peak = 0, clauses_live = 0, clauses_peak = 0;   // for the BRAM estimate
+    // with a BRAM budget: bits of clause-bank memory in use and available (bodies, headers, watches, learned binaries)
+    double live_bits = 0, cap_bits = 1e300;
+    int lbits = 16, abits = 18;
+    bool memout = false;
+    double clause_bits(u32 k) const { return (k + 2.0) * lbits + 2.0 * (abits + lbits); }
 
     std::vector<int8_t> val;          // per literal
     std::vector<int> level;
@@ -455,6 +463,25 @@ struct Solver {
     }
 
     // ---- helpers
+    static int clog2_(u64 x) { int b = 0; while ((1ull << b) < x) b++; return std::max(b, 1); }
+    double fixed_blocks() const {
+        auto blocks = [](double bits) { return bits <= 0 ? 0.0 : std::ceil(bits / 18432.0); };
+        double nn = std::max(1, n);
+        int vb = clog2_(n);
+        double b = blocks(2 * nn) * (P_active + 1) + blocks(nn * clog2_(n + 1)) + blocks(nn * (abits + 1)) + blocks(nn * lbits)
+                 + blocks(2 * nn) * 3 + blocks(nn * vb) * 2 + blocks(nn * 32) + blocks(2 * nn);
+        b += P_active * blocks(2 * nn * abits);                  // watch-list heads per bank
+        u64 nbin = 0; for (auto& l : bins) nbin += l.size();
+        b += blocks((double)nbin * lbits) + blocks(2 * nn * 16);  // original binaries + their heads
+        if (cfg.sls) {
+            u64 lits = 0; for (auto& c : F.clauses) lits += c.size();
+            double mc = std::max<double>(1, F.clauses.size());
+            int cb = clog2_((u64)mc);
+            b += blocks(mc * 4) + blocks(mc * vb) + blocks(mc * cb) * 2 + blocks(nn * 8) + blocks(2 * nn)
+               + blocks((double)lits * cb) + blocks(2 * nn * clog2_(lits + 2));
+        }
+        return b;
+    }
     u32* lits(u32 cr) { return &arena[cr + 2]; }
     u32 csize(u32 cr) const { return arena[cr]; }
     u32& meta(u32 cr) { return arena[cr + 1]; }
@@ -493,7 +520,8 @@ struct Solver {
         wl[p][c[0]].push_back({cr, c[1]});
         wl[p][c[1]].push_back({cr, c[0]});
         part_load[p] += 2;
-        arena_live += c.size();
+        arena_live += c.size(); clauses_live++; live_bits += clause_bits((u32)c.size());
+        arena_peak = std::max(arena_peak, arena_live); clauses_peak = std::max(clauses_peak, clauses_live);
         if (learned) learned_refs.push_back(cr);
         return cr;
     }
@@ -780,7 +808,8 @@ struct Solver {
         std::stable_sort(cand.begin(), cand.end(), [&](u32 a, u32 b) { return lbd_of(a) > lbd_of(b); });
         size_t kill = forced ? cand.size() * 3 / 4 : cand.size() / 2;
         for (size_t i = 0; i < kill; i++) {
-            meta(cand[i]) |= 1u << 17; arena_live -= csize(cand[i]); st.deleted++;
+            meta(cand[i]) |= 1u << 17; arena_live -= csize(cand[i]); clauses_live--; st.deleted++;
+            live_bits -= clause_bits(csize(cand[i]));
         }
         // rebuild watch lists without deleted clauses (all partitions in parallel)
         u64 maxw = 0;
@@ -816,6 +845,7 @@ struct Solver {
         if (learnt.size() == 2) {
             bins[learnt[0]].push_back(learnt[1]);
             bins[learnt[1]].push_back(learnt[0]);
+            live_bits += 2.0 * lbits;
             assign(learnt[0], BIN_FLAG | learnt[1]);
             cycles += 3;
             return true;
@@ -914,7 +944,13 @@ struct Solver {
                 bins[c[0]].push_back(c[1]); bins[c[1]].push_back(c[0]);   // (a|b): a false -> b
             } else add_clause_arena(c, false, 0);
         }
-        if (arena_live > cfg.arena_words) return -1;   // does not fit: rejected
+        if (cfg.bram > 0) {
+            // fixed structures first (per-variable state, list heads, binary unit heads, walker); the rest is bank space
+            lbits = clog2_(n) + 1;
+            double fixed = fixed_blocks();
+            cap_bits = (cfg.bram - fixed) * 18432.0 * 0.97;   // a little lost to per-bank rounding
+            if (live_bits > cap_bits) return -1;          // the original clauses do not fit: rejected
+        } else if (arena_live > cfg.arena_words) return -1;
         Walker w(F, cfg.seed * 7 + 3);
         if (cfg.sls) walker = &w;
         for (;;) {
@@ -939,7 +975,8 @@ struct Solver {
                 ema_fast += (lbd - ema_fast) * std::max(1.0 / 32, 1.0 / st.conflicts);
                 ema_slow += (lbd - ema_slow) * std::max(1e-5, 1.0 / st.conflicts);
                 learn(bt, lbd);
-                if (arena_live > cfg.arena_words * 9 / 10) reduce(true);
+                if (cfg.bram > 0 ? live_bits > 0.9 * cap_bits : arena_live > cfg.arena_words * 9 / 10) reduce(true);
+                if (live_bits > cap_bits) { memout = true; return 0; }   // even after reducing: out of memory
                 if (st.conflicts >= reduce_at) { reduce(false); reduce_k++; reduce_at = st.conflicts + 2000 + reduce_inc * reduce_k; }
                 if (cfg.stable && st.conflicts >= mode_switch_at) switch_mode();
                 else if (st.conflicts >= rephase_at) { backtrack(0); rephase(); }
@@ -965,6 +1002,39 @@ struct Solver {
     std::vector<std::vector<u32>> extra;   // derived by Gauss
 };
 
+// ------------------------------------------------------------------------------------------------ BRAM estimate
+// DP16KD blocks (18 Kbit) the design needs for this instance at its peak. Each structure is its own memory, so
+// each is rounded up to whole blocks; banked structures are rounded per bank.
+static int clog2(u64 x) { int b = 0; while ((1ull << b) < x) b++; return std::max(b, 1); }
+struct Bram { double per_var = 0, banks = 0, binaries = 0, walker = 0, gauss = 0; int total = 0; };
+static Bram bram_estimate(const Solver& s, const Formula& f) {
+    const double BLK = 18432.0;
+    auto blocks = [&](double bits) { return bits <= 0 ? 0.0 : std::ceil(bits / BLK); };
+    u64 n = std::max(1, f.nvars), m = std::max<u64>(1, s.clauses_peak);
+    int vb = clog2(n), lb = vb + 1, cb = clog2(m) + 1, ab = clog2(std::max<long>(2, s.arena_peak + 2 * s.clauses_peak));
+    int P = s.P_active;
+    Bram b;
+    // per-variable state: value copies (one per bank, dual-port), level, reason, trail, 3 phases, VMTF links+stamp, seen
+    b.per_var = blocks(2.0 * n) * (P + 1) + blocks((double)n * clog2(n + 1)) + blocks((double)n * (ab + 1))
+              + blocks((double)n * lb) + blocks(2.0 * n) * 3 + blocks((double)n * vb) * 2 + blocks(n * 32.0) + blocks(2.0 * n);
+    // per bank: clause bodies + headers, watch entries (clause ref + blocker), list heads
+    double body = (double)(s.arena_peak + 2 * s.clauses_peak) / P * lb, watches = 2.0 * s.clauses_peak / P * (ab + lb);
+    b.banks = P * (blocks(body) + blocks(watches) + blocks(2.0 * n * ab));
+    // binary implication lists
+    u64 nbin = 0; for (auto& l : s.bins) nbin += l.size();
+    b.binaries = blocks((double)nbin * lb) + blocks(2.0 * n * clog2(nbin + 2));
+    if (s.walker) {
+        u64 lits = 0; for (auto& c : f.clauses) lits += c.size();
+        u64 mc = std::max<u64>(1, f.clauses.size());
+        b.walker = blocks(mc * 4.0) + blocks((double)mc * vb) + blocks((double)mc * clog2(mc)) * 2 + blocks(n * 8.0)
+                 + blocks(2.0 * n) + blocks((double)lits * clog2(mc)) + blocks(2.0 * n * clog2(lits + 2));
+    }
+    if (s.gr.xors) b.gauss = blocks((double)s.gr.xors * s.gr.cols);   // borrowed from the banks before search
+    b.total = (int)(b.per_var + b.banks + b.binaries + b.walker);
+    if (b.gauss > b.banks) b.total += (int)(b.gauss - b.banks);    // only what the banks cannot lend
+    return b;
+}
+
 static bool check_model(const Formula& f, const std::vector<int8_t>& m) {
     for (auto& c : f.clauses) {
         bool ok = false;
@@ -989,6 +1059,7 @@ int main(int argc, char** argv) {
         else if (const char* v = opt("--limit")) cfg.limit_s = atof(v);
         else if (const char* v = opt("--seed")) cfg.seed = strtoull(v, nullptr, 10);
         else if (const char* v = opt("--arena")) cfg.arena_words = atol(v);
+        else if (const char* v = opt("--bram")) cfg.bram = atoi(v);
         else if (const char* v = opt("--stable")) cfg.stable = !strcmp(v, "off") ? 0 : !strcmp(v, "vsids") ? 2 : 1;
         else if (!strcmp(a, "--check")) cfg.check = true;
         else if (!strcmp(a, "--no-sls")) cfg.sls = false;
@@ -1000,7 +1071,7 @@ int main(int argc, char** argv) {
     if (!read_dimacs(argv[1], f)) { fprintf(stderr, "cannot read %s\n", argv[1]); return 2; }
     Solver s(cfg, f);
     int r = s.solve();
-    const char* res = r == 10 ? "SAT" : r == 20 ? "UNSAT" : r == -1 ? "REJECTED" : "UNKNOWN";
+    const char* res = r == 10 ? "SAT" : r == 20 ? "UNSAT" : r == -1 ? "REJECTED" : s.memout ? "MEMOUT" : "UNKNOWN";
     bool ok = true;
     if (r == 10) ok = check_model(f, s.model);
     double secs = s.cycles / (cfg.mhz * 1e6);
@@ -1008,6 +1079,9 @@ int main(int argc, char** argv) {
            " props %" PRIu64 " P %d sls %s%s\n",
            res, ok ? "" : "_INVALID", secs, s.cycles, s.st.conflicts, s.st.decisions, s.st.propagations,
            s.P_active, cfg.sls ? "on" : "off", s.from_walker ? " by_walker" : s.by_gauss ? " by_gauss" : "");
+    Bram br = bram_estimate(s, f);
+    fprintf(stderr, "bram: %d blocks (per-var %.0f, banks %.0f, binaries %.0f, walker %.0f, gauss %.0f borrowed)\n",
+            br.total, br.per_var, br.banks, br.binaries, br.walker, br.gauss);
     if (cfg.gauss && s.gr.xors)
         fprintf(stderr, "gauss: %d xors, %d units, %d equivalences, %" PRIu64 " cycles%s\n", s.gr.xors, s.gr.units,
                 s.gr.equivs, s.gr.cycles, s.gr.unsat ? ", inconsistent" : "");
