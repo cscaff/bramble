@@ -1,10 +1,11 @@
-"""Bramble's CDCL core, increment 2.1: one clause bank, linked watch lists, VMTF decisions, 1UIP learning.
+"""Bramble's CDCL core, increment 2.2: one clause bank, linked watch lists, VMTF decisions, 1UIP learning with
+recursive minimization, LBD, and restarts on moving averages of LBD.
 
 The algorithm follows the Bramble model (model/bramble.cpp) step for step; what is not here yet (minimization, LBD,
 restarts, reduction, banks, stable mode, the walker) arrives in later increments.
 
 Memories (one read and one write port each; every read takes a cycle):
-  arena   clause bodies: [size | flags] [reserved] lit0 lit1 ...            ARENA words of LB bits
+  arena   clause bodies: [size] [lbd | learned << 8] lit0 lit1 ...          ARENA words of LB bits
   wnode   watch nodes: (clause, blocker, next) - a clause has two           WN nodes
   whead   per literal: first watch node, or NIL
   bnode   binary nodes: (implied literal, next)  - (a|b) is a node b on a's list and a on b's
@@ -100,7 +101,10 @@ class Cdcl(Elaboratable):
         tr_r, tr_w = mem(m, "trail", LB, NV + 1)
         tl_r, tl_w = mem(m, "trail_lim", VB + 1, NV + 1)
         sav_r, sav_w = mem(m, "saved", 1, NV)
-        seen_r, seen_w = mem(m, "seen", 1, NV)
+        seen_r, seen_w = mem(m, "seen", 2, NV)          # 1: in the clause / analysed, 2: shown redundant
+        sk_r, sk_w = mem(m, "mstack", LB, NV)               # minimization: DFS stack
+        tc_r, tc_w = mem(m, "tclear", VB, NV)               # minimization: variables marked 2
+        ls_r, ls_w = mem(m, "lstamp", 32, NV + 1)           # LBD: the conflict that last counted a level
         stm_r, stm_w = mem(m, "stamp_ld", 18, NV)         # loading: (clause no., pos seen, neg seen)
         pv_r, pv_w = mem(m, "vprev", VB + 1, NV)
         nx_r, nx_w = mem(m, "vnext", VB + 1, NV)
@@ -179,6 +183,23 @@ class Cdcl(Elaboratable):
         learn_too_long = Signal()
         bump_v = Signal(VB)
         bt_to = Signal(VB + 1)
+        # minimization
+        abstract = Signal(32)
+        j = Signal(range(LMAX + 1))
+        mx = Signal(LB)                     # the literal being tested for redundancy
+        sp = Signal(VB + 1)                 # stack depth
+        ntc = Signal(VB + 1)                # entries in tclear
+        tc_top = Signal(VB + 1)
+        y = Signal(LB)
+        u = Signal(VB + 1)                  # undo index into tclear
+        curlvl = Signal(VB + 1)
+        # LBD, restarts
+        lbd = Signal(8)
+        ema_fast = Signal(signed(34))       # fixed point, 16 fraction bits
+        ema_slow = Signal(signed(34))
+        last_restart = Signal(32)
+        restarting = Signal()
+        self.restarts = Signal(32)
 
         def var(l): return l[1:LB]
 
@@ -210,7 +231,8 @@ class Cdcl(Elaboratable):
                     m.d.sync += [i.eq(0), aptr.eq(0), wptr.eq(0), bptr.eq(0), cl_start.eq(0), cl_len.eq(0),
                                  cl_no.eq(1), cl_drop.eq(0), reject.eq(0), oom.eq(0), unsat.eq(0), sat.eq(0),
                                  tlen.eq(0), qhead.eq(0), dl.eq(0), info_extra.eq(0), self.conflicts.eq(0),
-                                 self.decisions.eq(0)]
+                                 self.decisions.eq(0), ema_fast.eq(0), ema_slow.eq(0), last_restart.eq(0),
+                                 restarting.eq(0), self.restarts.eq(0)]
                     m.next = "LOAD"
                 with m.Else():
                     m.d.comb += [wh_w.addr.eq(i), wh_w.data.eq(NIL_W), wh_w.en.eq(1),
@@ -219,7 +241,8 @@ class Cdcl(Elaboratable):
                         m.d.comb += [val_w.addr.eq(i), val_w.data.eq(0), val_w.en.eq(1),
                                      stm_w.addr.eq(i), stm_w.data.eq(0), stm_w.en.eq(1),
                                      seen_w.addr.eq(i), seen_w.data.eq(0), seen_w.en.eq(1),
-                                     sav_w.addr.eq(i), sav_w.data.eq(0), sav_w.en.eq(1)]
+                                     sav_w.addr.eq(i), sav_w.data.eq(0), sav_w.en.eq(1),
+                                     ls_w.addr.eq(i), ls_w.data.eq(0), ls_w.en.eq(1)]
                     m.d.sync += i.eq(i + 1)
 
             # ------------------------------------------------------------ clause stream
@@ -290,8 +313,10 @@ class Cdcl(Elaboratable):
                         m.d.comb += [arena_w.addr.eq(cl_start), arena_w.data.eq(cl_len), arena_w.en.eq(1)]
                         m.d.sync += [cref.eq(cl_start), cl_start.eq(cl_start + 2 + cl_len), aptr.eq(cl_start + 2 + cl_len),
                                      lit.eq(cl_l0), klit.eq(cl_l1), i.eq(0)]
-                        m.d.comb += wh_r.addr.eq(cl_l0)
-                        m.next = "WATCH_ADD_RD"
+                        m.next = "CL_HDR2"
+            with m.State("CL_HDR2"):
+                m.d.comb += [arena_w.addr.eq(cref + 1), arena_w.data.eq(0), arena_w.en.eq(1)]
+                m.next = "WATCH_ADD_RD"
             with m.State("LD_UNIT"):
                 with m.If(is_false(val_r.data, lit)):
                     m.d.sync += unsat.eq(1)
@@ -542,7 +567,7 @@ class Cdcl(Elaboratable):
                 m.d.comb += [seen_r.addr.eq(var(vq)), lvl_r.addr.eq(var(vq))]
                 m.next = "AN_VISIT"
             with m.State("AN_VISIT"):
-                with m.If(~seen_r.data & (lvl_r.data != 0)):
+                with m.If((seen_r.data == 0) & (lvl_r.data != 0)):
                     m.d.comb += [seen_w.addr.eq(var(vq)), seen_w.data.eq(1), seen_w.en.eq(1),
                                  an_w.addr.eq(nana), an_w.data.eq(var(vq)), an_w.en.eq(1)]
                     m.d.sync += nana.eq(nana + 1)
@@ -571,14 +596,14 @@ class Cdcl(Elaboratable):
                 m.d.comb += seen_r.addr.eq(var(tr_r.data))
                 m.next = "AN_TRAIL_SEEN"
             with m.State("AN_TRAIL_SEEN"):
-                with m.If(~seen_r.data):
+                with m.If(seen_r.data == 0):
                     m.next = "AN_TRAIL_RD"
                 with m.Else():
                     m.d.comb += [seen_w.addr.eq(var(uip)), seen_w.data.eq(0), seen_w.en.eq(1)]
                     with m.If(pathc == 1):
                         m.d.comb += [lb_w.addr.eq(0), lb_w.data.eq(uip ^ 1), lb_w.en.eq(1)]
-                        m.d.sync += [pathc.eq(0), i.eq(0)]
-                        m.next = "AN_CLEAR_RD"
+                        m.d.sync += [pathc.eq(0), i.eq(1), abstract.eq(0)]
+                        m.next = "MIN_ABS_RD"
                     with m.Else():
                         m.d.sync += pathc.eq(pathc - 1)
                         m.d.comb += rsn_r.addr.eq(var(uip))
@@ -592,10 +617,128 @@ class Cdcl(Elaboratable):
                     m.d.sync += [rsrc.eq(r_), rpos.eq(1)]
                     m.d.comb += arena_r.addr.eq(r_[:AAW])
                     m.next = "AN_CL_HDR"
+            # ------------------------------------------------------------ minimization (MiniSat's, recursive)
+            # abstract levels of literals 1..
+            with m.State("MIN_ABS_RD"):
+                with m.If(i == lsize):
+                    m.d.sync += [i.eq(1), j.eq(1), ntc.eq(0)]
+                    m.next = "MIN_RD"
+                with m.Else():
+                    m.d.comb += lb_r.addr.eq(i)
+                    m.next = "MIN_ABS_LIT"
+            with m.State("MIN_ABS_LIT"):
+                m.d.comb += lvl_r.addr.eq(var(lb_r.data))
+                m.next = "MIN_ABS_LVL"
+            with m.State("MIN_ABS_LVL"):
+                m.d.sync += [abstract.eq(abstract | (Const(1, 32) << lvl_r.data[:5])), i.eq(i + 1)]
+                m.next = "MIN_ABS_RD"
+            # keep or drop each literal 1..
+            with m.State("MIN_RD"):
+                with m.If(i == lsize):
+                    m.d.sync += [lsize.eq(j), i.eq(0)]
+                    m.next = "TC_CLEAR_RD"
+                with m.Else():
+                    m.d.comb += lb_r.addr.eq(i)
+                    m.next = "MIN_LIT"
+            with m.State("MIN_LIT"):
+                m.d.sync += mx.eq(lb_r.data)
+                m.d.comb += rsn_r.addr.eq(var(lb_r.data))
+                m.next = "MIN_RSN"
+            with m.State("MIN_RSN"):
+                with m.If(rsn_r.data == R_NONE):
+                    m.next = "MIN_KEEP"
+                with m.Else():
+                    m.d.comb += [sk_w.addr.eq(0), sk_w.data.eq(mx), sk_w.en.eq(1)]
+                    m.d.sync += [sp.eq(1), tc_top.eq(ntc)]
+                    m.next = "RED_POP"
+            with m.State("MIN_KEEP"):
+                m.d.comb += [lb_w.addr.eq(j), lb_w.data.eq(mx), lb_w.en.eq(1)]
+                m.d.sync += [j.eq(j + 1), i.eq(i + 1)]
+                m.next = "MIN_RD"
+            # is mx implied by the other literals? Depth-first over reasons.
+            with m.State("RED_POP"):
+                with m.If(sp == 0):
+                    m.d.sync += i.eq(i + 1)             # redundant: dropped
+                    m.next = "MIN_RD"
+                with m.Else():
+                    m.d.comb += sk_r.addr.eq(sp - 1)
+                    m.next = "RED_POPPED"
+            with m.State("RED_POPPED"):
+                m.d.sync += [y.eq(sk_r.data), sp.eq(sp - 1)]
+                m.d.comb += rsn_r.addr.eq(var(sk_r.data))
+                m.next = "RED_RSN"
+            with m.State("RED_RSN"):
+                r_ = rsn_r.data
+                m.d.sync += [rsrc.eq(r_), rpos.eq(1)]
+                with m.If(r_ & R_BIN):
+                    m.d.sync += vq.eq(r_[:LB])
+                    m.next = "RED_Q_RD"
+                with m.Else():
+                    m.d.comb += arena_r.addr.eq(r_[:AAW])
+                    m.next = "RED_CL_HDR"
+            with m.State("RED_CL_HDR"):
+                m.d.sync += rsize.eq(arena_r.data[:SZW])
+                m.next = "RED_CL_RD"
+            with m.State("RED_CL_RD"):
+                with m.If(rpos == rsize):
+                    m.next = "RED_POP"
+                with m.Else():
+                    m.d.comb += arena_r.addr.eq(rsrc[:AAW] + 2 + rpos)
+                    m.next = "RED_CL_LIT"
+            with m.State("RED_CL_LIT"):
+                m.d.sync += [vq.eq(arena_r.data), rpos.eq(rpos + 1)]
+                m.next = "RED_Q_RD"
+            with m.State("RED_Q_RD"):
+                m.d.comb += [seen_r.addr.eq(var(vq)), lvl_r.addr.eq(var(vq)), rsn_r.addr.eq(var(vq))]
+                m.next = "RED_Q"
+            with m.State("RED_Q"):
+                skip = (seen_r.data != 0) | (lvl_r.data == 0)
+                push = ~skip & (rsn_r.data != R_NONE) & abstract.bit_select(lvl_r.data[:5], 1)
+                with m.If(~skip & ~push):
+                    # q is a decision or at a level outside the clause: mx is not redundant
+                    m.d.sync += u.eq(tc_top)
+                    m.next = "RED_FAIL_RD"
+                with m.Else():
+                    with m.If(push):
+                        m.d.comb += [seen_w.addr.eq(var(vq)), seen_w.data.eq(2), seen_w.en.eq(1),
+                                     sk_w.addr.eq(sp), sk_w.data.eq(vq), sk_w.en.eq(1),
+                                     tc_w.addr.eq(ntc), tc_w.data.eq(var(vq)), tc_w.en.eq(1)]
+                        m.d.sync += [sp.eq(sp + 1), ntc.eq(ntc + 1)]
+                    # next literal of this reason (a binary reason has only the one)
+                    with m.If(rsrc & R_BIN):
+                        m.next = "RED_POP"
+                    with m.Else():
+                        m.next = "RED_CL_RD"
+            # not redundant: undo the marks made while testing mx, and keep it
+            with m.State("RED_FAIL_RD"):
+                with m.If(u == ntc):
+                    m.d.sync += [ntc.eq(tc_top), sp.eq(0)]
+                    m.next = "MIN_KEEP"
+                with m.Else():
+                    m.d.comb += tc_r.addr.eq(u)
+                    m.next = "RED_FAIL"
+            with m.State("RED_FAIL"):
+                m.d.comb += [seen_w.addr.eq(tc_r.data), seen_w.data.eq(0), seen_w.en.eq(1)]
+                m.d.sync += u.eq(u + 1)
+                m.next = "RED_FAIL_RD"
+            # clear the redundancy marks
+            with m.State("TC_CLEAR_RD"):
+                with m.If(i == ntc):
+                    m.d.sync += i.eq(0)
+                    m.next = "AN_CLEAR_RD"
+                with m.Else():
+                    m.d.comb += tc_r.addr.eq(i)
+                    m.next = "TC_CLEAR"
+            with m.State("TC_CLEAR"):
+                m.d.comb += [seen_w.addr.eq(tc_r.data), seen_w.data.eq(0), seen_w.en.eq(1)]
+                m.d.sync += i.eq(i + 1)
+                m.next = "TC_CLEAR_RD"
+
             # clear `seen` of every analysed variable, bumping each in VMTF
             with m.State("AN_CLEAR_RD"):
                 with m.If(i == nana):
-                    m.d.sync += [i.eq(1), bmax.eq(1), bmaxlvl.eq(0)]
+                    m.d.sync += [i.eq(1), bmax.eq(1), bmaxlvl.eq(0), lbd.eq(1)]
+                    m.d.comb += [ls_w.addr.eq(dl), ls_w.data.eq(self.conflicts), ls_w.en.eq(1)]
                     m.next = "BT_FIND_RD"
                 with m.Else():
                     m.d.comb += an_r.addr.eq(i)
@@ -664,6 +807,14 @@ class Cdcl(Elaboratable):
             with m.State("BT_FIND_LVL"):
                 with m.If(lvl_r.data > bmaxlvl):
                     m.d.sync += [bmaxlvl.eq(lvl_r.data), bmax.eq(i)]
+                m.d.sync += curlvl.eq(lvl_r.data)
+                m.d.comb += ls_r.addr.eq(lvl_r.data)
+                m.next = "BT_LSTAMP"
+            with m.State("BT_LSTAMP"):          # a level not counted yet for this conflict
+                with m.If(ls_r.data != self.conflicts):
+                    m.d.comb += [ls_w.addr.eq(curlvl), ls_w.data.eq(self.conflicts), ls_w.en.eq(1)]
+                    with m.If(lbd != 255):
+                        m.d.sync += lbd.eq(lbd + 1)
                 m.d.sync += i.eq(i + 1)
                 m.next = "BT_FIND_RD"
             with m.State("BT_SWAP_A"):
@@ -686,7 +837,10 @@ class Cdcl(Elaboratable):
                 m.d.sync += bt_to.eq(Mux(btlvl == dl, tlen, tl_r.data))
                 m.next = "BT_RD"
             with m.State("BT_RD"):
-                with m.If(tlen == bt_to):
+                with m.If((tlen == bt_to) & restarting):
+                    m.d.sync += [dl.eq(btlvl), qhead.eq(bt_to), restarting.eq(0)]
+                    m.next = "PROP"
+                with m.Elif(tlen == bt_to):
                     m.d.sync += [dl.eq(btlvl), qhead.eq(bt_to), i.eq(0), learning.eq(1)]
                     m.next = "LEARN"
                 with m.Else():
@@ -733,7 +887,10 @@ class Cdcl(Elaboratable):
                 with m.Else():
                     m.d.comb += [arena_w.addr.eq(aptr), arena_w.data.eq(lsize), arena_w.en.eq(1)]
                     m.d.sync += [cref.eq(aptr), i.eq(0)]
-                    m.next = "LEARN_COPY_RD"
+                    m.next = "LEARN_HDR2"
+            with m.State("LEARN_HDR2"):
+                m.d.comb += [arena_w.addr.eq(cref + 1), arena_w.data.eq(Cat(lbd, Const(1, 1))), arena_w.en.eq(1)]
+                m.next = "LEARN_COPY_RD"
             with m.State("LEARN_UNIT"):
                 m.d.sync += lit.eq(lb_r.data)
                 m.next = "LEARN_ASSIGN"
@@ -775,7 +932,28 @@ class Cdcl(Elaboratable):
                              rsn_w.addr.eq(var(al)), rsn_w.data.eq(rsrc), rsn_w.en.eq(1),
                              tr_w.addr.eq(tlen), tr_w.data.eq(al), tr_w.en.eq(1)]
                 m.d.sync += [tlen.eq(tlen + 1), learning.eq(0), learn_too_long.eq(0)]
-                m.next = "PROP"
+                m.next = "EMA_UPD"
+            # exponential moving averages of LBD, warm-up rate 2^-floor(log2 conflicts) (the model does the same)
+            with m.State("EMA_UPD"):
+                msb = Signal(5)
+                for b_ in range(32):
+                    with m.If(self.conflicts[b_]):
+                        m.d.comb += msb.eq(b_)
+                sf = Mux(msb > 5, 5, msb)
+                ss = Mux(msb > 17, 17, msb)
+                xv = Signal(signed(34))
+                m.d.comb += xv.eq(lbd << 16)
+                m.d.sync += [ema_fast.eq(ema_fast + ((xv - ema_fast) >> sf)),
+                             ema_slow.eq(ema_slow + ((xv - ema_slow) >> ss))]
+                m.next = "RESTART_CHK"
+            with m.State("RESTART_CHK"):
+                with m.If((dl != 0) & (self.conflicts - last_restart >= 2) &
+                          (ema_fast > ema_slow + (ema_slow >> 3))):
+                    m.d.sync += [self.restarts.eq(self.restarts + 1), last_restart.eq(self.conflicts),
+                                 btlvl.eq(0), restarting.eq(1)]
+                    m.next = "BT_START"
+                with m.Else():
+                    m.next = "PROP"
 
             # ------------------------------------------------------------ decisions (VMTF)
             with m.State("DECIDE_RD"):
