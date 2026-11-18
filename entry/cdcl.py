@@ -1,11 +1,19 @@
-"""Bramble's CDCL core, increment 2.2: one clause bank, linked watch lists, VMTF decisions, 1UIP learning with
-recursive minimization, LBD, and restarts on moving averages of LBD.
+"""Bramble's CDCL core, increment 2.3: one clause bank, linked watch lists, VMTF decisions, 1UIP learning with
+recursive minimization, LBD, restarts on moving averages of LBD, and tiered clause-database reduction.
 
 The algorithm follows the Bramble model (model/bramble.cpp) step for step; what is not here yet (minimization, LBD,
 restarts, reduction, banks, stable mode, the walker) arrives in later increments.
 
 Memories (one read and one write port each; every read takes a cycle):
-  arena   clause bodies: [size] [lbd | learned << 8] lit0 lit1 ...          ARENA words of LB bits
+  arena   clause bodies: [size] [lbd | learned << 8 | used << 9] lit0 lit1 ...   ARENA words of LB bits
+  hist    reduction: learned-clause count per LBD
+
+Reduction (every 2000 + 300k conflicts, or forced when the arena or the watch nodes pass 90%) runs at decision level
+0. Learned clauses with LBD <= 2 stay; LBD <= 6 stay if used in a conflict since the last reduction; of the rest,
+the worse half (three quarters when forced) by LBD goes, the earliest first among equal LBD - exactly the clauses a
+stable sort by LBD would pick, found with a histogram instead of a sort. The surviving clauses are compacted to the
+front of the arena, every watch list is rebuilt, and the root trail is propagated again (the rebuilt watches may sit
+on literals already false at the root). Root-level reasons are never read, so their clauses may go.
   wnode   watch nodes: (clause, blocker, next) - a clause has two           WN nodes
   whead   per literal: first watch node, or NIL
   bnode   binary nodes: (implied literal, next)  - (a|b) is a node b on a's list and a on b's
@@ -86,6 +94,8 @@ class Cdcl(Elaboratable):
         self.idle = Signal()             # in INIT or waiting for clauses: holds no solving state
         self.conflicts = Signal(32)
         self.decisions = Signal(32)
+        self.restarts = Signal(32)
+        self.reduces = Signal(32)
 
     def elaborate(self, platform):  # noqa: C901 - one controller, read top to bottom
         m = Module()
@@ -112,6 +122,7 @@ class Cdcl(Elaboratable):
         st2_r = m.submodules["vstamp"].read_port()          # a second read port: the search pointer's stamp
         lb_r, lb_w = mem(m, "lbuf", LB, LMAX)
         an_r, an_w = mem(m, "ana", VB, NV)
+        hi_r, hi_w = mem(m, "hist", AAW + 1, 256)
 
         def wnode(cref, blocker, nxt):
             return Cat(cref[:AAW], blocker[:LB], nxt[:WAW])
@@ -199,7 +210,20 @@ class Cdcl(Elaboratable):
         ema_slow = Signal(signed(34))
         last_restart = Signal(32)
         restarting = Signal()
-        self.restarts = Signal(32)
+        reducing = Signal()
+        forced = Signal()
+        reduce_at = Signal(32)
+        reduce_k = Signal(16)
+        rp = Signal(AAW + 1)                # read position in the arena
+        wq = Signal(AAW + 1)                # write position (compaction)
+        hsz = Signal(SZW)                   # size of the clause at rp
+        hd2 = Signal(LB)                    # its second header word
+        ncand = Signal(AAW + 1)
+        kill = Signal(AAW + 1)
+        acc = Signal(AAW + 1)
+        thr = Signal(9)                     # LBD threshold (256: delete nothing)
+        rem = Signal(AAW + 1)               # still to delete at LBD == thr
+        cpos = Signal(SZW + 2)              # word being copied
 
         def var(l): return l[1:LB]
 
@@ -232,7 +256,8 @@ class Cdcl(Elaboratable):
                                  cl_no.eq(1), cl_drop.eq(0), reject.eq(0), oom.eq(0), unsat.eq(0), sat.eq(0),
                                  tlen.eq(0), qhead.eq(0), dl.eq(0), info_extra.eq(0), self.conflicts.eq(0),
                                  self.decisions.eq(0), ema_fast.eq(0), ema_slow.eq(0), last_restart.eq(0),
-                                 restarting.eq(0), self.restarts.eq(0)]
+                                 restarting.eq(0), self.restarts.eq(0), self.reduces.eq(0), reducing.eq(0),
+                                 reduce_at.eq(2000), reduce_k.eq(0)]
                     m.next = "LOAD"
                 with m.Else():
                     m.d.comb += [wh_w.addr.eq(i), wh_w.data.eq(NIL_W), wh_w.en.eq(1),
@@ -553,6 +578,12 @@ class Cdcl(Elaboratable):
             # expand a clause (the conflict, rpos from 0; or a reason, rpos from 1)
             with m.State("AN_CL_HDR"):
                 m.d.sync += rsize.eq(arena_r.data[:SZW])
+                m.d.comb += arena_r.addr.eq(rsrc[:AAW] + 1)
+                m.next = "AN_CL_HDR2"
+            with m.State("AN_CL_HDR2"):         # a learned clause used in this conflict
+                with m.If(arena_r.data[8]):
+                    m.d.comb += [arena_w.addr.eq(rsrc[:AAW] + 1), arena_w.data.eq(arena_r.data | (1 << 9)),
+                                 arena_w.en.eq(1)]
                 m.next = "AN_CL_RD"
             with m.State("AN_CL_RD"):
                 with m.If(rpos == rsize):
@@ -837,7 +868,10 @@ class Cdcl(Elaboratable):
                 m.d.sync += bt_to.eq(Mux(btlvl == dl, tlen, tl_r.data))
                 m.next = "BT_RD"
             with m.State("BT_RD"):
-                with m.If((tlen == bt_to) & restarting):
+                with m.If((tlen == bt_to) & reducing):
+                    m.d.sync += [dl.eq(0), qhead.eq(bt_to), i.eq(0)]
+                    m.next = "RD_HCLR"
+                with m.Elif((tlen == bt_to) & restarting):
                     m.d.sync += [dl.eq(btlvl), qhead.eq(bt_to), restarting.eq(0)]
                     m.next = "PROP"
                 with m.Elif(tlen == bt_to):
@@ -945,7 +979,17 @@ class Cdcl(Elaboratable):
                 m.d.comb += xv.eq(lbd << 16)
                 m.d.sync += [ema_fast.eq(ema_fast + ((xv - ema_fast) >> sf)),
                              ema_slow.eq(ema_slow + ((xv - ema_slow) >> ss))]
-                m.next = "RESTART_CHK"
+                m.next = "REDUCE_CHK"
+            with m.State("REDUCE_CHK"):
+                full = (aptr > (ARENA * 9) // 10) | (wptr > (WN * 9) // 10)
+                with m.If(full | (self.conflicts >= reduce_at)):
+                    m.d.sync += [forced.eq(full), reducing.eq(1), btlvl.eq(0), self.reduces.eq(self.reduces + 1)]
+                    with m.If(~full):
+                        m.d.sync += [reduce_k.eq(reduce_k + 1),
+                                     reduce_at.eq(self.conflicts + 2000 + 300 * (reduce_k + 1))]
+                    m.next = "BT_START"
+                with m.Else():
+                    m.next = "RESTART_CHK"
             with m.State("RESTART_CHK"):
                 with m.If((dl != 0) & (self.conflicts - last_restart >= 2) &
                           (ema_fast > ema_slow + (ema_slow >> 3))):
@@ -954,6 +998,136 @@ class Cdcl(Elaboratable):
                     m.next = "BT_START"
                 with m.Else():
                     m.next = "PROP"
+
+            # ------------------------------------------------------------ reduction (at level 0)
+            with m.State("RD_HCLR"):            # clear the LBD histogram
+                with m.If(i == 256):
+                    m.d.sync += [rp.eq(0), ncand.eq(0)]
+                    m.next = "RD1_RD"
+                with m.Else():
+                    m.d.comb += [hi_w.addr.eq(i), hi_w.data.eq(0), hi_w.en.eq(1)]
+                    m.d.sync += i.eq(i + 1)
+            # pass 1: histogram of the candidates
+            with m.State("RD1_RD"):
+                with m.If(rp >= aptr):
+                    m.d.sync += [kill.eq(Mux(forced, ((ncand << 1) + ncand) >> 2, ncand >> 1)), acc.eq(0), thr.eq(255)]
+                    m.next = "RD_TH_RD"
+                with m.Else():
+                    m.d.comb += arena_r.addr.eq(rp)
+                    m.next = "RD1_HDR"
+            with m.State("RD1_HDR"):
+                m.d.sync += hsz.eq(arena_r.data[:SZW])
+                m.d.comb += arena_r.addr.eq(rp + 1)
+                m.next = "RD1_HDR2"
+            candidate = lambda h: h[8] & ~(h[:8] <= 2) & ~((h[:8] <= 6) & h[9])
+            with m.State("RD1_HDR2"):
+                m.d.sync += [hd2.eq(arena_r.data), rp.eq(rp + 2 + hsz)]
+                with m.If(candidate(arena_r.data)):
+                    m.d.comb += hi_r.addr.eq(arena_r.data[:8])
+                    m.next = "RD1_HIST"
+                with m.Else():
+                    m.next = "RD1_RD"
+            with m.State("RD1_HIST"):
+                m.d.comb += [hi_w.addr.eq(hd2[:8]), hi_w.data.eq(hi_r.data + 1), hi_w.en.eq(1)]
+                m.d.sync += ncand.eq(ncand + 1)
+                m.next = "RD1_RD"
+            # threshold: delete every candidate with LBD > thr, and `rem` of those with LBD == thr
+            with m.State("RD_TH_RD"):
+                with m.If(kill == 0):
+                    m.d.sync += [thr.eq(256), rem.eq(0), rp.eq(0), wq.eq(0)]
+                    m.next = "RD2_RD"
+                with m.Else():
+                    m.d.comb += hi_r.addr.eq(thr[:8])
+                    m.next = "RD_TH"
+            with m.State("RD_TH"):
+                with m.If(acc + hi_r.data >= kill):
+                    m.d.sync += [rem.eq(kill - acc), rp.eq(0), wq.eq(0)]
+                    m.next = "RD2_RD"
+                with m.Else():
+                    m.d.sync += [acc.eq(acc + hi_r.data), thr.eq(thr - 1)]
+                    m.next = "RD_TH_RD"
+            # pass 2: delete and compact
+            with m.State("RD2_RD"):
+                with m.If(rp >= aptr):
+                    m.d.sync += [aptr.eq(wq), i.eq(0)]
+                    m.next = "RD_WCLR"
+                with m.Else():
+                    m.d.comb += arena_r.addr.eq(rp)
+                    m.next = "RD2_HDR"
+            with m.State("RD2_HDR"):
+                m.d.sync += hsz.eq(arena_r.data[:SZW])
+                m.d.comb += arena_r.addr.eq(rp + 1)
+                m.next = "RD2_HDR2"
+            with m.State("RD2_HDR2"):
+                h = arena_r.data
+                lbd_ = Cat(h[:8], Const(0, 1))
+                dele = candidate(h) & ((lbd_ > thr) | ((lbd_ == thr) & (rem != 0)))
+                with m.If(dele):
+                    with m.If(lbd_ == thr):
+                        m.d.sync += rem.eq(rem - 1)
+                    m.d.sync += rp.eq(rp + 2 + hsz)
+                    m.next = "RD2_RD"
+                with m.Else():
+                    # keep: header words to wq (used flag cleared), then the literals
+                    m.d.comb += [arena_w.addr.eq(wq), arena_w.data.eq(hsz), arena_w.en.eq(1)]
+                    m.d.sync += [hd2.eq(h & ~(1 << 9)), cpos.eq(0)]
+                    m.next = "RD2_HDR2W"
+            with m.State("RD2_HDR2W"):
+                m.d.comb += [arena_w.addr.eq(wq + 1), arena_w.data.eq(hd2), arena_w.en.eq(1)]
+                m.next = "RD2_CP_RD"
+            with m.State("RD2_CP_RD"):
+                with m.If(cpos == hsz):
+                    m.d.sync += [rp.eq(rp + 2 + hsz), wq.eq(wq + 2 + hsz)]
+                    m.next = "RD2_RD"
+                with m.Else():
+                    m.d.comb += arena_r.addr.eq(rp + 2 + cpos)
+                    m.next = "RD2_CP"
+            with m.State("RD2_CP"):
+                m.d.comb += [arena_w.addr.eq(wq + 2 + cpos), arena_w.data.eq(arena_r.data), arena_w.en.eq(1)]
+                m.d.sync += cpos.eq(cpos + 1)
+                m.next = "RD2_CP_RD"
+            # rebuild every watch list
+            with m.State("RD_WCLR"):
+                with m.If(i == 2 * NV):
+                    m.d.sync += [wptr.eq(0), rp.eq(0)]
+                    m.next = "RD3_RD"
+                with m.Else():
+                    m.d.comb += [wh_w.addr.eq(i), wh_w.data.eq(NIL_W), wh_w.en.eq(1)]
+                    m.d.sync += i.eq(i + 1)
+            with m.State("RD3_RD"):
+                with m.If(rp >= aptr):
+                    # done: propagate the root trail again over the new watches
+                    m.d.sync += [reducing.eq(0), qhead.eq(0)]
+                    with m.If(forced & ((aptr > (ARENA * 9) // 10) | (wptr > (WN * 9) // 10))):
+                        m.d.sync += [oom.eq(1), info_extra.eq(info_extra | INFO_OUT_OF_MEMORY)]
+                        m.next = "DONE"                   # nothing left to delete: out of memory
+                    with m.Else():
+                        m.next = "PROP"
+                with m.Else():
+                    m.d.comb += arena_r.addr.eq(rp)
+                    m.next = "RD3_HDR"
+            with m.State("RD3_HDR"):
+                m.d.sync += [hsz.eq(arena_r.data[:SZW]), cref.eq(rp)]
+                m.d.comb += arena_r.addr.eq(rp + 2)
+                m.next = "RD3_L0"
+            with m.State("RD3_L0"):
+                m.d.sync += lit.eq(arena_r.data)
+                m.d.comb += arena_r.addr.eq(rp + 3)
+                m.next = "RD3_L1"
+            with m.State("RD3_L1"):
+                m.d.sync += [klit.eq(arena_r.data), i.eq(0), rp.eq(rp + 2 + hsz)]
+                m.next = "RD3_W_RD"
+            with m.State("RD3_W_RD"):
+                m.d.comb += wh_r.addr.eq(lit)
+                m.next = "RD3_W"
+            with m.State("RD3_W"):
+                m.d.comb += [wn_w.addr.eq(wptr), wn_w.data.eq(wnode(cref, klit, wh_r.data)), wn_w.en.eq(1),
+                             wh_w.addr.eq(lit), wh_w.data.eq(wptr), wh_w.en.eq(1)]
+                m.d.sync += [wptr.eq(wptr + 1), lit.eq(klit), klit.eq(lit), i.eq(i + 1)]
+                with m.If(i == 1):
+                    m.next = "RD3_RD"
+                with m.Else():
+                    m.next = "RD3_W_RD"
 
             # ------------------------------------------------------------ decisions (VMTF)
             with m.State("DECIDE_RD"):

@@ -92,8 +92,8 @@ int main(int argc, char** argv) {
     if (d->rejected) { printf("RESULT rejected CYCLES %llu\n", (unsigned long long)(cyc - t0)); return 0; }
     if (!d->done) { printf("RESULT timeout CYCLES %llu CONFLICTS %u LEARNED %llu CHECKED %llu\n", (unsigned long long)(cyc - t0), d->conflicts, (unsigned long long)learned, (unsigned long long)checked); return 0; }
     int res = d->result;
-    printf("RESULT %d CYCLES %llu CONFLICTS %u DECISIONS %u LEARNED %llu CHECKED %llu INFO 0x%x\n", res,
-           (unsigned long long)(cyc - t0), d->conflicts, d->decisions, (unsigned long long)learned, (unsigned long long)checked, d->info);
+    printf("RESULT %d CYCLES %llu CONFLICTS %u DECISIONS %u LEARNED %llu CHECKED %llu INFO 0x%x RESTARTS %u REDUCES %u\n", res,
+           (unsigned long long)(cyc - t0), d->conflicts, d->decisions, (unsigned long long)learned, (unsigned long long)checked, d->info, d->restarts, d->reduces);
     if (res == 1) {
         std::vector<int> model(nv + 1, 0);
         for (int v = 0; v < nv; v++) { d->model_addr = v; tick(); tick(); model[v + 1] = d->model_val ? 1 : -1; }
