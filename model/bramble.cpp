@@ -795,12 +795,10 @@ struct Solver {
     // ---- clause database reduction
     void reduce(int level) {   // 0 scheduled, 1 forced, 2 also used tier 2, 3 every learned clause but reasons
         bool forced = level > 0;
+        backtrack(0);              // the hardware reduces at the root
         st.reduces++; if (forced) st.forced_reduces++;
         // protect reasons
-        auto locked = [&](u32 cr) {
-            u32 l0 = lits(cr)[0], v = var_of(l0);
-            return val[l0] == 1 && reason[v] == cr;
-        };
+        auto locked = [&](u32) { return false; };   // at the root no reason is ever read again
         std::vector<u32> cand;
         u64 work = 0;
         for (u32 cr : learned_refs) {
@@ -953,7 +951,7 @@ struct Solver {
     bool want_restart() {
         if (stable) return st.conflicts >= luby_next;
         if (st.conflicts - last_restart_conf < 2) return false;
-        return ema_fast > 1.1 * ema_slow;
+        return ema_fast > 1.125 * ema_slow;   // the hardware's slow + slow/8
     }
     void do_restart() {
         st.restarts++;
@@ -1064,9 +1062,11 @@ struct Solver {
                 if (stable) update_targets();
                 int lbd = 0;
                 int bt = analyze(confl, lbd);
-                // exponential moving averages with warm-up (shift-and-add in hardware)
-                ema_fast += (lbd - ema_fast) * std::max(1.0 / 32, 1.0 / st.conflicts);
-                ema_slow += (lbd - ema_slow) * std::max(1e-5, 1.0 / st.conflicts);
+                // exponential moving averages, as the hardware does them: rate 2^-floor(log2 conflicts), at least
+                // 2^-5 (fast) and 2^-17 (slow)
+                { int msb = 63 - __builtin_clzll(st.conflicts);
+                  ema_fast += (lbd - ema_fast) / (double)(1ull << std::min(msb, 5));
+                  ema_slow += (lbd - ema_slow) / (double)(1ull << std::min(msb, 17)); }
                 learn(bt, lbd);
                 for (int lvl = 1; lvl <= 3 && (cfg.bram > 0 ? live_bits > 0.9 * cap_bits
                                                          : arena_live > cfg.arena_words * 9 / 10); lvl++) reduce(lvl);

@@ -1,7 +1,8 @@
-"""Bramble stage 1 (XOR recovery + Gauss) through the real register-map shell, in simulation.
+"""Bramble through the real register-map shell, in simulation.
 
-The answer is UNSAT only when the formula's XOR constraints are inconsistent, and UNKNOWN otherwise; never SAT, and
-never UNSAT on a satisfiable formula.
+The Gauss front end is tested on its own (behind the same shell): UNSAT only when the formula's XOR constraints are
+inconsistent, UNKNOWN otherwise. The full solver (front end, then the CDCL core) must answer every small formula
+correctly, with a model for SAT.
 """
 
 import itertools
@@ -10,6 +11,25 @@ import pytest
 from amaranth.sim import Simulator
 
 import design as D
+from amaranth import Elaboratable, Module, Signal, signed
+from amaranth.hdl import ResetInserter
+from solver import GaussFront
+
+
+class GaussOnly(Elaboratable):
+    """The Gauss front end alone, with the solver interface (its UNKNOWN is final here)."""
+    max_vars, max_clauses, max_lits = 512, 1 << 20, 1 << 22
+
+    def __init__(self):
+        self.f = GaussFront()
+        for name in ("start", "abort", "nvars", "nclauses", "nlits", "load_valid", "load_data", "model_addr",
+                     "idle", "load_ready", "done", "rejected", "result", "info", "model_val"):
+            setattr(self, name, getattr(self.f, name))
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.f = self.f
+        return ResetInserter({"sync": self.abort})(m)
 
 START, ABORT = 1, 2
 S_BUSY, S_DONE, S_REJ = 1, 2, 4
@@ -74,9 +94,9 @@ GAUSS_ONLY = 17   # declaring more variables than the brute force takes keeps th
 
 
 def run(cases):
-    """cases: list of (nvars, clauses, expected result), run on one board with aborts in between. nvars is raised to
-    GAUSS_ONLY so that the answer comes from XOR recovery and elimination alone."""
-    dut = D.Entry()
+    """cases: list of (nvars, clauses, expected result), run on one board with aborts in between, through the Gauss
+    front end alone."""
+    dut = D.Entry(solver_cls=GaussOnly)
     sim = Simulator(dut)
     sim.add_clock(1e-6)
     got = []
@@ -97,8 +117,9 @@ def triangle(rhs):   # x1^x2=1, x2^x3=1, x1^x3=rhs: inconsistent iff rhs == 1
 
 
 def test_capacity_is_declared():
+    import cdcl
     from solver import Solver
-    assert (Solver.max_vars, Solver.max_clauses, Solver.max_lits) == (512, 1 << 20, 1 << 22)
+    assert (Solver.max_vars, Solver.max_clauses, Solver.max_lits) == (cdcl.NV - 1, (1 << 16) - 1, cdcl.ARENA)
 
 
 def test_inconsistent_xors_are_unsat_and_consistent_ones_unknown():
@@ -178,7 +199,7 @@ def test_variables_past_the_columns_are_left_out_not_misread():
 
 
 def test_abort_mid_load_then_a_clean_second_instance():
-    dut = D.Entry()
+    dut = D.Entry(solver_cls=GaussOnly)
     sim = Simulator(dut)
     sim.add_clock(1e-6)
     out = []
@@ -199,7 +220,7 @@ def test_abort_mid_load_then_a_clean_second_instance():
     assert out[0][0] == UNKNOWN
 
 
-# ---------------------------------------------------------------------------- small instances: brute force
+# ---------------------------------------------------------------------------- the full solver (front end + CDCL core)
 TINY_SAT = (4, [[1, 2], [-1, 3], [-2, -3], [3, 4], [-4, 1]])      # the pre-flight's built-in instances
 TINY_UNSAT = (2, [[1, 2], [-1, 2], [1, -2], [-1, -2]])
 
@@ -239,7 +260,7 @@ def test_the_preflight_builtins_are_answered_correctly_with_a_model():
     assert r2 == UNSAT
 
 
-def test_brute_force_on_random_small_formulas_matches_exhaustive_search():
+def test_random_small_formulas_match_exhaustive_search():
     import random
     rnd = random.Random(3)
     cases = []
@@ -285,6 +306,7 @@ def test_start_abort_then_a_correct_solve():   # the pre-flight's abort smoke te
     assert res == SAT and satisfies(model, TINY_SAT[1])
 
 
-def test_seventeen_variables_are_left_to_gauss():   # past the brute-force size: never a guess
-    (res, info, _), = solve_with_models([(17, [[17], [1, 2]])])
-    assert res == UNKNOWN
+def test_the_core_takes_over_when_gauss_proves_nothing_and_gauss_answers_first_when_it_can():
+    (r1, _, m1), (r2, i2, _) = solve_with_models([(17, [[17], [1, 2]]), (17, triangle(1))])
+    assert r1 == SAT and satisfies(m1, [[17], [1, 2]])
+    assert r2 == UNSAT and i2 & (1 << 19)     # INFO_GAUSS: the front end proved it
