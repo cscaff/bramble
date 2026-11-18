@@ -310,3 +310,26 @@ def test_the_core_takes_over_when_gauss_proves_nothing_and_gauss_answers_first_w
     (r1, _, m1), (r2, i2, _) = solve_with_models([(17, [[17], [1, 2]]), (17, triangle(1))])
     assert r1 == SAT and satisfies(m1, [[17], [1, 2]])
     assert r2 == UNSAT and i2 & (1 << 19)     # INFO_GAUSS: the front end proved it
+
+
+def test_every_local_module_the_design_imports_is_listed_in_info_yaml():
+    # 2026-11-18: cdcl.py was missing from sourcefiles and the cloud build failed at `import cdcl`
+    import ast
+    from pathlib import Path
+
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    listed = set(yaml.safe_load((root / "info.yaml").read_text())["username"]["sourcefiles"])
+    todo, seen = ["design.py"], set()
+    while todo:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        for node in ast.walk(ast.parse((root / f).read_text())):
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+                [node.module] if isinstance(node, ast.ImportFrom) and node.module else []
+            for name in names:
+                if (root / f"{name.split('.')[0]}.py").exists():
+                    todo.append(f"{name.split('.')[0]}.py")
+    assert seen <= listed, f"imported but not in info.yaml: {sorted(seen - listed)}"
