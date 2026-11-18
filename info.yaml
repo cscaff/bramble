@@ -2,9 +2,9 @@
 yaml_version: 1
 
 project:
-  title: "Bramble (stage 1: XOR + Gauss)"
+  title: "Bramble (stage 2: Gauss front end + CDCL core)"
   author: "Christian Scaff"
-  description: "Stage 1 of Bramble: recovers XOR constraints from the clauses and proves UNSAT by Gauss-Jordan elimination over GF(2); UNKNOWN otherwise. Organizer reference entry."
+  description: "Bramble stage 2: XOR recovery and Gauss-Jordan elimination, then a CDCL core (VMTF, 1UIP with minimization, LBD restarts, tiered reduction). Organizer reference entry."
   language: amaranth          # amaranth | verilog
   clock_hz: 50000000          # your design clock, in Hz
 
@@ -17,3 +17,4 @@ username:
   sourcefiles:
     - design.py
     - solver.py
+    - cdcl.py
