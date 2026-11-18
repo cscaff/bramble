@@ -49,6 +49,7 @@ struct Config {
     int bram = 0;                 // entry BRAM budget in DP16KD blocks (0: unlimited); the ECP5-85F has 208, the SoC uses 25
     bool verbose = false;
     bool gauss = true;            // XOR recovery + Gauss-Jordan before search
+    double vivify = 0.15;         // share of cycles for vivifying learned clauses (0: off)
     int gauss_width = 8;          // longest clause considered part of an XOR
     int gauss_word = 36;          // bits per row-XOR cycle (one DP16KD port at 36 bits)
 };
@@ -382,6 +383,7 @@ struct Stats {
     u64 conflicts = 0, decisions = 0, propagations = 0, restarts = 0, reduces = 0, learned = 0, deleted = 0;
     u64 cyc_bcp = 0, cyc_analyze = 0, cyc_decide = 0, cyc_backtrack = 0, cyc_reduce = 0, cyc_other = 0;
     u64 rephases = 0, walk_rephases = 0, forced_reduces = 0, checked = 0;
+    u64 viv_tried = 0, viv_shrunk = 0, viv_lits_removed = 0, viv_units = 0, cyc_vivify = 0, walker_flips = 0;
 };
 
 struct Solver {
@@ -443,6 +445,11 @@ struct Solver {
     u64 lstamp = 0;
 
     Checker* chk = nullptr;
+    u32 ignore_cr = REASON_NONE;          // the clause being vivified takes no part in propagation
+    bool probing = false;                 // vivification: do not save its assignments as phases
+    bool walker_dropped = false;          // the instance needed the walker's memory
+    std::vector<u32> occ_count;           // literal occurrences in the original clauses (a static table)
+    u64 viv_mark = 0;                     // cycles at the end of the last vivification round
     Walker* walker = nullptr;
     u64 cycles = 0, cycle_limit;
     u64 walker_synced = 0;
@@ -464,7 +471,7 @@ struct Solver {
 
     // ---- helpers
     static int clog2_(u64 x) { int b = 0; while ((1ull << b) < x) b++; return std::max(b, 1); }
-    double fixed_blocks() const {
+    double fixed_blocks(bool with_walker) const {
         auto blocks = [](double bits) { return bits <= 0 ? 0.0 : std::ceil(bits / 18432.0); };
         double nn = std::max(1, n);
         int vb = clog2_(n);
@@ -473,7 +480,7 @@ struct Solver {
         b += P_active * blocks(2 * nn * abits);                  // watch-list heads per bank
         u64 nbin = 0; for (auto& l : bins) nbin += l.size();
         b += blocks((double)nbin * lbits) + blocks(2 * nn * 16);  // original binaries + their heads
-        if (cfg.sls) {
+        if (with_walker) {
             u64 lits = 0; for (auto& c : F.clauses) lits += c.size();
             double mc = std::max<double>(1, F.clauses.size());
             int cb = clog2_((u64)mc);
@@ -553,7 +560,8 @@ struct Solver {
                 for (; i < ws.size(); i++) {
                     Watch w = ws[i];
                     work++;   // read watch + blocker value
-                    if (val[w.blocker] == 1) { ws[j++] = w; continue; }
+                    if (val[w.blocker] == 1 || w.cref == ignore_cr) { ws[j++] = w; continue; }
+                    if (is_deleted(w.cref)) continue;   // dropped lazily
                     u32 cr = w.cref;
                     u32* c = lits(cr);
                     u32 sz = csize(cr);
@@ -674,7 +682,7 @@ struct Solver {
         u64 w = 0;
         for (size_t i = trail.size(); i-- > to;) {
             u32 l = trail[i], v = var_of(l);
-            saved[v] = (l & 1) ? -1 : 1;
+            if (!probing) saved[v] = (l & 1) ? -1 : 1;
             val[l] = 0; val[l ^ 1] = 0; reason[v] = REASON_NONE;
             if (stamp[v] > stamp[vmtf_search == ~0u ? v : vmtf_search] || vmtf_search == ~0u) vmtf_search = v;
             if (cfg.stable == 2) hinsert(v);
@@ -785,7 +793,8 @@ struct Solver {
     void mark_used(u32 cr) { if (is_learned(cr)) meta(cr) |= 1u << 18; }
 
     // ---- clause database reduction
-    void reduce(bool forced) {
+    void reduce(int level) {   // 0 scheduled, 1 forced, 2 also used tier 2, 3 every learned clause but reasons
+        bool forced = level > 0;
         st.reduces++; if (forced) st.forced_reduces++;
         // protect reasons
         auto locked = [&](u32 cr) {
@@ -800,13 +809,14 @@ struct Solver {
             int lbd = lbd_of(cr);
             bool used = meta(cr) >> 18 & 1;
             meta(cr) &= ~(1u << 18);
-            if (lbd <= 2 || locked(cr)) continue;     // tier 1: keep
-            if (lbd <= 6 && used) continue;           // tier 2: keep while used
+            if (locked(cr)) continue;
+            if (lbd <= 2 && level < 3) continue;          // tier 1: keep
+            if (lbd <= 6 && used && level < 2) continue;  // tier 2: keep while used
             cand.push_back(cr);
         }
         // bucket by LBD (counting sort), delete the worse half
         std::stable_sort(cand.begin(), cand.end(), [&](u32 a, u32 b) { return lbd_of(a) > lbd_of(b); });
-        size_t kill = forced ? cand.size() * 3 / 4 : cand.size() / 2;
+        size_t kill = level >= 2 ? cand.size() : forced ? cand.size() * 3 / 4 : cand.size() / 2;
         for (size_t i = 0; i < kill; i++) {
             meta(cand[i]) |= 1u << 17; arena_live -= csize(cand[i]); clauses_live--; st.deleted++;
             live_bits -= clause_bits(csize(cand[i]));
@@ -827,6 +837,82 @@ struct Solver {
         learned_refs.swap(keep);
         work += maxw + 2 * n;   // the head sweep is per literal
         cycles += work; st.cyc_reduce += work;
+    }
+
+    // ---- vivification: shorten learned clauses with the propagation engine (root level, budgeted)
+    bool vivify_round() {   // false if the formula was found UNSAT
+        backtrack(0);
+        if (!propagate()) return false;
+        u64 budget = (u64)(cfg.vivify * (cycles - viv_mark)), start = cycles;
+        std::vector<u32> cand;
+        for (u32 cr : learned_refs) {
+            if (is_deleted(cr) || (meta(cr) >> 19 & 1) || lbd_of(cr) > 6) continue;
+            cand.push_back(cr);
+        }
+        std::stable_sort(cand.begin(), cand.end(), [&](u32 a, u32 b) { return lbd_of(a) < lbd_of(b); });
+        std::vector<u32> lits_, keep;
+        for (u32 cr : cand) {
+            if (cycles - start > budget) break;
+            if (is_deleted(cr)) continue;
+            u32 l0 = lits(cr)[0];
+            if (val[l0] == 1 && reason[var_of(l0)] == cr) continue;   // a root-level reason: leave it
+            meta(cr) |= 1u << 19;
+            st.viv_tried++;
+            u32 sz = csize(cr);
+            lits_.assign(lits(cr), lits(cr) + sz);
+            bool sat_root = false;
+            keep.clear();
+            for (u32 l : lits_) { if (val[l] == 1) sat_root = true; else if (val[l] == 0) keep.push_back(l); }
+            if (sat_root) { delete_clause(cr); continue; }
+            // most frequent literals first (they propagate most)
+            std::sort(keep.begin(), keep.end(), [&](u32 a, u32 b) { return occ_count[a] > occ_count[b]; });
+            cycles += keep.size() * keep.size() / 2 + 2;   // small insertion sort in the controller
+            if (keep.empty()) return false;   // every literal false at the root: UNSAT
+            ignore_cr = cr; probing = true;
+            std::vector<u32> out;
+            bool done = false;
+            for (u32 l : keep) {
+                if (val[l] == 1) { out.push_back(l); done = true; break; }   // implied by the others: stop here
+                if (val[l] == -1) continue;                                   // implied false: drop it
+                out.push_back(l);
+                trail_lim.push_back(trail.size());
+                assign(l ^ 1, REASON_NONE);
+                if (!propagate()) { done = true; break; }                     // the others already conflict
+            }
+            (void)done;
+            ignore_cr = REASON_NONE;
+            backtrack(0);
+            probing = false;
+            if (out.size() >= sz) continue;
+            st.viv_shrunk++; st.viv_lits_removed += sz - out.size();
+            int lbd = std::min<int>(lbd_of(cr), (int)out.size());
+            delete_clause(cr);
+            learnt = out;
+            if (chk) {
+                if (!chk->rup(learnt)) { fprintf(stderr, "CHECK FAILED: vivified clause is not RUP\n"); exit(3); }
+                chk->add(learnt); st.checked++;
+            }
+            if (out.size() == 1) {
+                st.viv_units++;
+                assign(out[0], REASON_NONE);
+                if (!propagate()) return false;
+            } else if (out.size() == 2) {
+                bins[out[0]].push_back(out[1]); bins[out[1]].push_back(out[0]);
+                live_bits += 2.0 * lbits; cycles += 3;
+            } else {
+                u32 ncr = add_clause_arena(out, true, lbd);
+                meta(ncr) |= 1u << 19;
+                cycles += (out.size() + 1) / 2 + 2;
+            }
+        }
+        st.cyc_vivify += cycles - start;
+        viv_mark = cycles;
+        return true;
+    }
+    void delete_clause(u32 cr) {   // lazily: watch lists drop it at the next reduction
+        if (is_deleted(cr)) return;
+        meta(cr) |= 1u << 17; arena_live -= csize(cr); clauses_live--; st.deleted++;
+        live_bits -= clause_bits(csize(cr));
     }
 
     // ---- learning
@@ -944,15 +1030,21 @@ struct Solver {
                 bins[c[0]].push_back(c[1]); bins[c[1]].push_back(c[0]);   // (a|b): a false -> b
             } else add_clause_arena(c, false, 0);
         }
+        occ_count.assign(2 * n, 0);
+        for (auto& c : F.clauses) for (u32 l : c) occ_count[l]++;
         if (cfg.bram > 0) {
             // fixed structures first (per-variable state, list heads, binary unit heads, walker); the rest is bank space
             lbits = clog2_(n) + 1;
-            double fixed = fixed_blocks();
+            double fixed = fixed_blocks(cfg.sls);
             cap_bits = (cfg.bram - fixed) * 18432.0 * 0.97;   // a little lost to per-bank rounding
+            if (cfg.sls && live_bits > 0.8 * cap_bits) {      // tight: the walker's memory goes to the banks
+                walker_dropped = true;
+                cap_bits = (cfg.bram - fixed_blocks(false)) * 18432.0 * 0.97;
+            }
             if (live_bits > cap_bits) return -1;          // the original clauses do not fit: rejected
         } else if (arena_live > cfg.arena_words) return -1;
         Walker w(F, cfg.seed * 7 + 3);
-        if (cfg.sls) walker = &w;
+        if (cfg.sls && !walker_dropped) walker = &w;
         for (;;) {
             if (cycles >= cycle_limit) return 0;
             if (walker && cycles - walker_synced > 20000) {   // the walker runs alongside: give it the same cycles
@@ -964,6 +1056,7 @@ struct Solver {
                     return 10;
                 }
                 walker_synced = cycles;
+                st.walker_flips = walker->flips;
             }
             if (!propagate()) {
                 st.conflicts++;
@@ -975,9 +1068,14 @@ struct Solver {
                 ema_fast += (lbd - ema_fast) * std::max(1.0 / 32, 1.0 / st.conflicts);
                 ema_slow += (lbd - ema_slow) * std::max(1e-5, 1.0 / st.conflicts);
                 learn(bt, lbd);
-                if (cfg.bram > 0 ? live_bits > 0.9 * cap_bits : arena_live > cfg.arena_words * 9 / 10) reduce(true);
-                if (live_bits > cap_bits) { memout = true; return 0; }   // even after reducing: out of memory
-                if (st.conflicts >= reduce_at) { reduce(false); reduce_k++; reduce_at = st.conflicts + 2000 + reduce_inc * reduce_k; }
+                for (int lvl = 1; lvl <= 3 && (cfg.bram > 0 ? live_bits > 0.9 * cap_bits
+                                                         : arena_live > cfg.arena_words * 9 / 10); lvl++) reduce(lvl);
+                if (live_bits > cap_bits) { memout = true; return 0; }   // only reasons and originals left
+                if (st.conflicts >= reduce_at) {
+                    reduce(0); reduce_k++; reduce_at = st.conflicts + 2000 + reduce_inc * reduce_k;
+                    if (cfg.vivify > 0 && !vivify_round()) return 20;
+                    continue;
+                }
                 if (cfg.stable && st.conflicts >= mode_switch_at) switch_mode();
                 else if (st.conflicts >= rephase_at) { backtrack(0); rephase(); }
                 else if (want_restart()) do_restart();
@@ -1064,6 +1162,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--check")) cfg.check = true;
         else if (!strcmp(a, "--no-sls")) cfg.sls = false;
         else if (!strcmp(a, "--no-gauss")) cfg.gauss = false;
+        else if (const char* v = opt("--vivify")) cfg.vivify = atof(v);
         else if (!strcmp(a, "-v")) cfg.verbose = true;
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
@@ -1078,7 +1177,7 @@ int main(int argc, char** argv) {
     printf("result %s%s time_s %.4f cycles %" PRIu64 " conflicts %" PRIu64 " decisions %" PRIu64
            " props %" PRIu64 " P %d sls %s%s\n",
            res, ok ? "" : "_INVALID", secs, s.cycles, s.st.conflicts, s.st.decisions, s.st.propagations,
-           s.P_active, cfg.sls ? "on" : "off", s.from_walker ? " by_walker" : s.by_gauss ? " by_gauss" : "");
+           s.P_active, cfg.sls ? (s.walker_dropped ? "dropped" : "on") : "off", s.from_walker ? " by_walker" : s.by_gauss ? " by_gauss" : "");
     Bram br = bram_estimate(s, f);
     fprintf(stderr, "bram: %d blocks (per-var %.0f, banks %.0f, binaries %.0f, walker %.0f, gauss %.0f borrowed)\n",
             br.total, br.per_var, br.banks, br.binaries, br.walker, br.gauss);
@@ -1092,7 +1191,9 @@ int main(int argc, char** argv) {
         printf("restarts %" PRIu64 " reduces %" PRIu64 " (forced %" PRIu64 ") learned %" PRIu64 " deleted %" PRIu64
                " rephases %" PRIu64 " (walk %" PRIu64 ") checked %" PRIu64 " walker_flips %" PRIu64 "\n",
                t.restarts, t.reduces, t.forced_reduces, t.learned, t.deleted, t.rephases, t.walk_rephases, t.checked,
-               s.walker ? s.walker->flips : 0);
+               t.walker_flips);
+        printf("vivify: tried %" PRIu64 " shrunk %" PRIu64 " literals removed %" PRIu64 " units %" PRIu64 " cycles %" PRIu64 "\n",
+               t.viv_tried, t.viv_shrunk, t.viv_lits_removed, t.viv_units, t.cyc_vivify);
     }
     return ok ? (r == 10 ? 10 : r == 20 ? 20 : 0) : 4;
 }
