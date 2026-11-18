@@ -4,3 +4,5 @@ model/bramble
 results/
 __pycache__/
 model/bramble_*
+verify/obj_dir/
+verify/entry.v
