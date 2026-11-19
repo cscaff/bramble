@@ -27,11 +27,13 @@ UNSAT is claimed only from genuine XOR constraints or a conflict at decision lev
 assignment that satisfies every clause. Running out of any memory gives UNKNOWN (or a rejection at load), never a
 wrong answer.
 
-Declared capacity: 2,047 variables, 65,535 clauses, 36,864 literal slots for long clauses (at most 8K long and 8K
-binary clauses). Resources: 176 block RAMs for the entry by synthesis (the first leaderboard run, before the walker
-and the larger arena and binary store, showed 142), about 13,600 LUTs and 6,400 FFs.
+Declared capacity: 2,047 variables, 65,535 clauses, 32,768 literal slots for long clauses (at most 8K long and 8K
+binary clauses). Resources: about 148 block RAMs for the entry (counted per memory; the first leaderboard run showed 142). A real
+cloud build's SoC uses about 53 of the 208, so an entry gets about 155, not the published 183 (FPSAT#21): the build
+with 176 failed at placement. The walker (20 blocks) is therefore off (`USE_WALKER` in `solver.py`); the XOR hash
+table is 512 entries.
 The first leaderboard run rejected 21 instances outright for exceeding the old capacities (4K binary clauses, 32K
-arena slots); the binary store was doubled and the arena grown for that.
+arena slots); the binary store was doubled for that (the arena is back at 32K).
 
 ## Verification
 

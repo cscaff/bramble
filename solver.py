@@ -32,11 +32,16 @@ K = 7                 # widest clause considered part of an XOR
 VB = 9                # variable index bits: columns 0..511
 C = 1 << VB           # Gauss columns (variables)
 R = 256               # Gauss rows (XOR constraints)
-EB = 10               # hash table index bits
+EB = 9                # hash table index bits
 E = 1 << EB           # hash table entries
 PROBE_LIMIT = 64      # linear probing gives up after this many slots: the clause is left out (sound, see below)
 KEY_W = 1 + 3 + K * VB      # valid, width, variables
 MASK_W = 1 << K             # one bit per sign pattern
+
+# Block RAM budget: a real cloud build's SoC uses about 53 of the 208 block RAMs (the firmware ROM is not in
+# `mrg pnr`'s count), so an entry gets about 155, not the published 183 (FPSAT#21, mrg-sandbox#35). The walker's
+# memories cost 20 and it only takes formulas under 512 variables, so it is off to stay under the budget.
+USE_WALKER = False
 
 BF_VARS = 16          # brute force: variables
 BF_WORDS = 256        # brute force: clause-stream words kept
@@ -426,7 +431,11 @@ class Solver(Elaboratable):
         m = Module()
         m.submodules.front = front = GaussFront()
         m.submodules.core = core = cdcl.Cdcl()
-        m.submodules.walker = walk = walker.Walker()
+        walk = walker.Walker()
+        if USE_WALKER:
+            m.submodules.walker = walk
+        else:
+            walk._MustUse__silence = True      # its signals stay undriven (constant 0)
         both_ready = front.load_ready & core.load_ready
         core_started = Signal()
         m.d.comb += [
@@ -441,12 +450,15 @@ class Solver(Elaboratable):
             self.model_val.eq(Mux(walk.solved, walk.model_val, core.model_val)),
             # the walker (probSAT) beside the core: it reads the clauses the core keeps while loading, borrows the
             # arena's read port when the core leaves it idle, and starts when the core starts searching
-            walk.ev_valid.eq(core.ev_valid), walk.ev_kind.eq(core.ev_kind), walk.ev_l0.eq(core.ev_l0),
-            walk.ev_l1.eq(core.ev_l1), walk.ev_cref.eq(core.ev_cref), walk.ev_len.eq(core.ev_len),
-            walk.nvars.eq(self.nvars), walk.go.eq(core.ev_done), walk.stop.eq(core.done),
-            walk.arena_data.eq(core.arena_data), walk.walk_ok.eq(core.walk_ok),
-            core.walk_addr.eq(walk.walk_addr), core.walk_req.eq(walk.walk_req), core.walk_busy.eq(walk.busy), walk.model_addr.eq(self.model_addr),
         ]
+        if USE_WALKER:
+            m.d.comb += [
+                walk.ev_valid.eq(core.ev_valid), walk.ev_kind.eq(core.ev_kind), walk.ev_l0.eq(core.ev_l0),
+                walk.ev_l1.eq(core.ev_l1), walk.ev_cref.eq(core.ev_cref), walk.ev_len.eq(core.ev_len),
+                walk.nvars.eq(self.nvars), walk.go.eq(core.ev_done), walk.stop.eq(core.done),
+                walk.arena_data.eq(core.arena_data), walk.walk_ok.eq(core.walk_ok),
+                core.walk_addr.eq(walk.walk_addr), core.walk_req.eq(walk.walk_req), core.walk_busy.eq(walk.busy), walk.model_addr.eq(self.model_addr),
+            ]
         front_proved = front.done & (front.result == 2)
         # the front end has finished without a proof: hand over to the core (once)
         with m.If(front.done & ~front_proved & ~core_started):
