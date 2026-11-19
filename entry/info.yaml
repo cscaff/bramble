@@ -2,7 +2,7 @@
 yaml_version: 1
 
 project:
-  title: "Bramble (stage 2.5: Gauss front end + CDCL core + walker)"
+  title: "Bramble (stage 2.5: Gauss front end + CDCL core)"
   author: "Christian Scaff"
   description: "Bramble stage 2: XOR recovery and Gauss-Jordan elimination, then a CDCL core (VMTF, 1UIP with minimization, LBD restarts, tiered reduction). Organizer reference entry."
   language: amaranth          # amaranth | verilog

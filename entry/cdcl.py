@@ -39,7 +39,7 @@ VB = 11                  # variable index bits: up to NV - 1 = 2047 variables (s
 NV = 1 << VB
 LB = VB + 1              # literal bits
 AAW = 16                 # arena address bits
-ARENA = 36864            # literal slots, headers included (a multiple of 4096 keeps the BRAM tiling tight)
+ARENA = 32768            # literal slots, headers included (a multiple of 4096 keeps the BRAM tiling tight)
 WAW = 14                 # watch node address bits (two per long clause): 8K long clauses
 WN = 1 << WAW
 BAW = 14                 # binary node address bits (two per binary clause): 8K binary clauses
