@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Every public instance through the Verilated entry, the way the runner drives it; each answer is checked.
 
-  verify/run_public.py TB_BINARY [--cap=CYCLES] [--model=MODEL_BINARY]
+  verify/run_public.py TB_BINARY [--cap=CYCLES] [--model=MODEL_BINARY] [--only=ID,ID..] [--jobs=N]
 
 UNSAT must match the instance's known result; SAT must come with a model that satisfies every clause. With
 --model, the Bramble model's own verdict is printed alongside (its Gauss stage should agree exactly with stage 1).
@@ -36,6 +36,9 @@ def main():
     opts = dict(a[2:].split("=", 1) for a in sys.argv[2:] if a.startswith("--"))
     cap = int(opts.get("cap", 200_000_000))
     rows = [l.split("\t") for l in (ROOT / "bench" / "index.tsv").read_text().splitlines()]
+    if "only" in opts:
+        keep = opts["only"].split(",")
+        rows = [r for r in rows if any(k in r[0] for k in keep)]
     bad, tally = [], {}
 
     def one(r):
