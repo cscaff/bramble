@@ -1,7 +1,7 @@
 # Bramble
 
 An AgentSAT entry for the Lattice ECP5-85F, built from scratch around the chip's block RAM. Organizer-built
-reference entry, developed in stages; this is **stage 2**.
+reference entry, developed in stages; this is **stage 2.5**.
 
 ## How it solves
 
@@ -18,13 +18,20 @@ reference entry, developed in stages; this is **stage 2**.
    - tiered clause-database reduction (LBD <= 2 kept, <= 6 kept while used, the worse half of the rest deleted),
      compaction and a watch rebuild at the root.
 
+3. **Local-search walker** (probSAT) beside the core, for small formulas (under 512 variables, 2,047 clauses, 4,096
+   literals; larger ones leave it off). Before the core starts searching it pauses the core for a few thousand
+   cycles and copies every clause into its own literal store, so it never reads the arena the core is rewriting.
+   Its SAT answer is claimed only when its exactly kept counts show no unsatisfied clause.
+
 UNSAT is claimed only from genuine XOR constraints or a conflict at decision level 0; SAT only with a full
 assignment that satisfies every clause. Running out of any memory gives UNKNOWN (or a rejection at load), never a
 wrong answer.
 
-Declared capacity: 2,047 variables, 65,535 clauses, 32,768 literal slots for long clauses (at most 8K long and 4K
-binary clauses). Resources (place and route at 50 MHz, full SoC): 167 of 208 block RAMs, about 18,800 LUTs and
-8,100 FFs; user clock 57.6 MHz.
+Declared capacity: 2,047 variables, 65,535 clauses, 36,864 literal slots for long clauses (at most 8K long and 8K
+binary clauses). Resources: 176 block RAMs for the entry by synthesis (the first leaderboard run, before the walker
+and the larger arena and binary store, showed 142), about 13,600 LUTs and 6,400 FFs.
+The first leaderboard run rejected 21 instances outright for exceeding the old capacities (4K binary clauses, 32K
+arena slots); the binary store was doubled and the arena grown for that.
 
 ## Verification
 
@@ -35,12 +42,12 @@ binary clauses). Resources (place and route at 50 MHz, full SoC): 167 of 208 blo
 
 ## Next stages
 
-A local-search engine (probSAT) beside the core, trading phases with it; stable mode and rephasing; a second
-propagation bank.
+The walker trading phases with the core; stable mode and rephasing; a second propagation bank.
 
 ## Files
 
 - `design.py`: the competition register-map shell, unchanged from the template.
 - `solver.py`: the Gauss front end, and the solver that runs it and then the core.
 - `cdcl.py`: the CDCL core.
+- `walker.py`: the probSAT walker.
 - `tests/`: simulation tests (`pytest`), including the shell's smoke tests.

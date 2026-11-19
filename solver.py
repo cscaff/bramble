@@ -26,6 +26,7 @@ from amaranth import Array, Cat, Const, Elaboratable, Module, Mux, ResetInserter
 from amaranth.lib.memory import Memory
 
 import cdcl
+import walker
 
 K = 7                 # widest clause considered part of an XOR
 VB = 9                # variable index bits: columns 0..511
@@ -46,6 +47,7 @@ INFO_ROWS_FULL = 1 << 17
 INFO_TOO_WIDE = 1 << 18      # instance has more variables than columns: no elimination
 INFO_GAUSS = 1 << 19
 INFO_BRUTE = 1 << 20         # the answer came from trying every assignment
+INFO_WALKER = 1 << 21        # the answer came from the local-search walker
 
 
 def parity_select(k, par):
@@ -424,6 +426,7 @@ class Solver(Elaboratable):
         m = Module()
         m.submodules.front = front = GaussFront()
         m.submodules.core = core = cdcl.Cdcl()
+        m.submodules.walker = walk = walker.Walker()
         both_ready = front.load_ready & core.load_ready
         core_started = Signal()
         m.d.comb += [
@@ -435,7 +438,14 @@ class Solver(Elaboratable):
             core.model_addr.eq(self.model_addr),
             self.load_ready.eq(both_ready),
             self.idle.eq(front.idle & core.idle),
-            self.model_val.eq(core.model_val),
+            self.model_val.eq(Mux(walk.solved, walk.model_val, core.model_val)),
+            # the walker (probSAT) beside the core: it reads the clauses the core keeps while loading, borrows the
+            # arena's read port when the core leaves it idle, and starts when the core starts searching
+            walk.ev_valid.eq(core.ev_valid), walk.ev_kind.eq(core.ev_kind), walk.ev_l0.eq(core.ev_l0),
+            walk.ev_l1.eq(core.ev_l1), walk.ev_cref.eq(core.ev_cref), walk.ev_len.eq(core.ev_len),
+            walk.nvars.eq(self.nvars), walk.go.eq(core.ev_done), walk.stop.eq(core.done),
+            walk.arena_data.eq(core.arena_data), walk.walk_ok.eq(core.walk_ok),
+            core.walk_addr.eq(walk.walk_addr), core.walk_req.eq(walk.walk_req), core.walk_busy.eq(walk.busy), walk.model_addr.eq(self.model_addr),
         ]
         front_proved = front.done & (front.result == 2)
         # the front end has finished without a proof: hand over to the core (once)
@@ -448,5 +458,7 @@ class Solver(Elaboratable):
             m.d.comb += [self.rejected.eq(1), self.info.eq(core.info)]
         with m.Elif(core.done):
             m.d.comb += [self.done.eq(1), self.result.eq(core.result), self.info.eq(core.info | (front.info & 0xFFFF))]
+        with m.Elif(walk.solved):
+            m.d.comb += [self.done.eq(1), self.result.eq(1), self.info.eq(INFO_WALKER)]
         # abort: both drop everything and start over
         return ResetInserter({"sync": self.abort})(m)

@@ -38,11 +38,11 @@ from amaranth.lib.memory import Memory
 VB = 11                  # variable index bits: up to NV - 1 = 2047 variables (so depth-NV memories suffice)
 NV = 1 << VB
 LB = VB + 1              # literal bits
-AAW = 15                 # arena address bits
-ARENA = 1 << AAW         # literal slots, headers included
+AAW = 16                 # arena address bits
+ARENA = 36864            # literal slots, headers included (a multiple of 4096 keeps the BRAM tiling tight)
 WAW = 14                 # watch node address bits (two per long clause): 8K long clauses
 WN = 1 << WAW
-BAW = 13                 # binary node address bits (two per binary clause): 4K binary clauses
+BAW = 14                 # binary node address bits (two per binary clause): 8K binary clauses
 BN = 1 << BAW
 LMAX = 1024              # longest learned clause
 NIL_W = (1 << WAW) - 1   # end of a watch list (node WN-1 is never allocated)
@@ -92,6 +92,21 @@ class Cdcl(Elaboratable):
         self.dbg_learn_valid = Signal()
         self.dbg_learn_end = Signal()
         self.idle = Signal()             # in INIT or waiting for clauses: holds no solving state
+        # the walker's share of the arena read port: granted on cycles the core leaves it idle
+        self.walk_addr = Signal(AAW)
+        self.walk_req = Signal()
+        self.walk_ok = Signal()           # registered: the arena data below answers the walker's request
+        self.arena_data = Signal(LB)
+        # clauses kept while loading (for the walker): kind 0 unit, 1 binary, 2 long
+        self.ev_valid = Signal()
+        self.ev_kind = Signal(2)
+        self.ev_l0 = Signal(LB)
+        self.ev_l1 = Signal(LB)
+        self.ev_cref = Signal(AAW)
+        self.ev_len = Signal(SZW)
+        self.searching = Signal()         # the core has begun solving
+        self.ev_done = Signal()           # the clause stream is over and the core has taken `start`: the walker copies
+        self.walk_busy = Signal()         # the walker is copying the clauses: the core waits (the arena stays still)
         self.conflicts = Signal(32)
         self.decisions = Signal(32)
         self.restarts = Signal(32)
@@ -122,6 +137,11 @@ class Cdcl(Elaboratable):
         lb_r, lb_w = mem(m, "lbuf", LB, LMAX)
         an_r, an_w = mem(m, "ana", VB, NV)
         hi_r, hi_w = mem(m, "hist", AAW + 1, 256)
+
+        arena_ra = Signal(AAW)
+        arena_rq = Signal()
+        m.d.comb += [arena_r.addr.eq(Mux(arena_rq, arena_ra, self.walk_addr)), self.arena_data.eq(arena_r.data)]
+        m.d.sync += self.walk_ok.eq(self.walk_req & ~arena_rq)
 
         def wnode(cref, blocker, nxt):
             return Cat(cref[:AAW], blocker[:LB], nxt[:WAW])
@@ -233,7 +253,7 @@ class Cdcl(Elaboratable):
         def is_false(vdata, l):
             return vdata[0] & ~(vdata[1] ^ l[0])
 
-        m.d.comb += [self.dbg_learn_valid.eq(0), self.dbg_learn_end.eq(0), self.rejected.eq(0)]
+        m.d.comb += [self.dbg_learn_valid.eq(0), self.dbg_learn_end.eq(0), self.rejected.eq(0), self.ev_valid.eq(0), self.ev_done.eq(0)]
 
         # model readback: the value memory, read at model_addr (registered output)
         model_rd = Signal()
@@ -274,6 +294,7 @@ class Cdcl(Elaboratable):
             with m.State("LOAD"):
                 m.d.comb += [self.load_ready.eq(1), self.idle.eq(1)]
                 with m.If(self.start | start_pending):
+                    m.d.comb += self.ev_done.eq(1)
                     m.d.sync += [n.eq(self.nvars[:VB + 1]), i.eq(0), start_pending.eq(0),
                                  reject.eq(reject | (self.nvars >= NV))]
                     m.next = "VMTF_INIT"
@@ -322,6 +343,7 @@ class Cdcl(Elaboratable):
                     m.d.sync += unsat.eq(1)                  # the empty clause
                 with m.Elif(cl_len == 1):
                     m.d.comb += val_r.addr.eq(var(cl_l0))
+                    m.d.comb += [self.ev_valid.eq(1), self.ev_kind.eq(0), self.ev_l0.eq(cl_l0)]
                     m.d.sync += lit.eq(cl_l0)
                     m.next = "LD_UNIT"
                 with m.Elif(cl_len == 2):
@@ -329,6 +351,7 @@ class Cdcl(Elaboratable):
                         m.d.sync += reject.eq(1)
                     with m.Else():
                         m.d.comb += bh_r.addr.eq(cl_l0)
+                        m.d.comb += [self.ev_valid.eq(1), self.ev_kind.eq(1), self.ev_l0.eq(cl_l0), self.ev_l1.eq(cl_l1)]
                         m.d.sync += [lit.eq(cl_l0), klit.eq(cl_l1), i.eq(0)]
                         m.next = "BIN_ADD_RD"
                 with m.Else():
@@ -336,6 +359,8 @@ class Cdcl(Elaboratable):
                         m.d.sync += reject.eq(1)
                     with m.Else():
                         m.d.comb += [arena_w.addr.eq(cl_start), arena_w.data.eq(cl_len), arena_w.en.eq(1)]
+                        m.d.comb += [self.ev_valid.eq(1), self.ev_kind.eq(2), self.ev_cref.eq(cl_start),
+                                     self.ev_len.eq(cl_len), self.ev_l0.eq(cl_l0), self.ev_l1.eq(cl_l1)]
                         m.d.sync += [cref.eq(cl_start), cl_start.eq(cl_start + 2 + cl_len), aptr.eq(cl_start + 2 + cl_len),
                                      lit.eq(cl_l0), klit.eq(cl_l1), i.eq(0)]
                         m.next = "CL_HDR2"
@@ -398,9 +423,12 @@ class Cdcl(Elaboratable):
                     m.next = "DONE_REJECT"
                 with m.Elif(unsat):
                     m.next = "DONE"
+                with m.Elif(((i == n) | (i == NV)) & self.walk_busy):
+                    pass                                # the walker is copying the clauses out of the arena
                 with m.Elif((i == n) | (i == NV)):
                     m.d.sync += [vfirst.eq(Mux(n == 0, NIL_V, 0)), vlast.eq(Mux(n == 0, NIL_V, n - 1)),
-                                 vsearch.eq(Mux(n == 0, NIL_V, n - 1)), sctr.eq(n + 1), learning.eq(0)]
+                                 vsearch.eq(Mux(n == 0, NIL_V, n - 1)), sctr.eq(n + 1), learning.eq(0),
+                                 self.searching.eq(1)]
                     m.next = "PROP"
                 with m.Else():
                     m.d.comb += [pv_w.addr.eq(i), pv_w.data.eq(Mux(i == 0, NIL_V, i - 1)), pv_w.en.eq(1),
@@ -469,15 +497,15 @@ class Cdcl(Elaboratable):
                     m.d.sync += [prev.eq(cur), cur.eq(nxt)]
                     m.next = "W_NODE_RD"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(cref)
+                    m.d.comb += [arena_ra.eq(cref), arena_rq.eq(1)]
                     m.next = "W_HDR"
             with m.State("W_HDR"):
                 m.d.sync += csize.eq(arena_r.data[:SZW])
-                m.d.comb += arena_r.addr.eq(cref + 2)
+                m.d.comb += [arena_ra.eq(cref + 2), arena_rq.eq(1)]
                 m.next = "W_L0"
             with m.State("W_L0"):
                 m.d.sync += lit.eq(arena_r.data)
-                m.d.comb += arena_r.addr.eq(cref + 3)
+                m.d.comb += [arena_ra.eq(cref + 3), arena_rq.eq(1)]
                 m.next = "W_L1"
             with m.State("W_L1"):
                 # make literal 1 the false one (f); literal 0 is then the other watch
@@ -507,7 +535,7 @@ class Cdcl(Elaboratable):
                 with m.If(k == csize):
                     m.next = "W_NOWATCH"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(cref + 2 + k)
+                    m.d.comb += [arena_ra.eq(cref + 2 + k), arena_rq.eq(1)]
                     m.next = "W_SCAN_LIT"
             with m.State("W_SCAN_LIT"):
                 m.d.sync += klit.eq(arena_r.data)
@@ -573,12 +601,12 @@ class Cdcl(Elaboratable):
                         m.next = "AN_VISIT_RD"          # visit confl_b, then the "reason" literal confl_a
                     with m.Else():
                         m.d.sync += [rsrc.eq(confl_cref), rsize.eq(0)]
-                        m.d.comb += arena_r.addr.eq(confl_cref)
+                        m.d.comb += [arena_ra.eq(confl_cref), arena_rq.eq(1)]
                         m.next = "AN_CL_HDR"
             # expand a clause (the conflict, rpos from 0; or a reason, rpos from 1)
             with m.State("AN_CL_HDR"):
                 m.d.sync += rsize.eq(arena_r.data[:SZW])
-                m.d.comb += arena_r.addr.eq(rsrc[:AAW] + 1)
+                m.d.comb += [arena_ra.eq(rsrc[:AAW] + 1), arena_rq.eq(1)]
                 m.next = "AN_CL_HDR2"
             with m.State("AN_CL_HDR2"):         # a learned clause used in this conflict
                 with m.If(arena_r.data[8]):
@@ -589,7 +617,7 @@ class Cdcl(Elaboratable):
                 with m.If(rpos == rsize):
                     m.next = "AN_TRAIL_RD"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(rsrc[:AAW] + 2 + rpos)
+                    m.d.comb += [arena_ra.eq(rsrc[:AAW] + 2 + rpos), arena_rq.eq(1)]
                     m.next = "AN_CL_LIT"
             with m.State("AN_CL_LIT"):
                 m.d.sync += [vq.eq(arena_r.data), rpos.eq(rpos + 1)]
@@ -646,7 +674,7 @@ class Cdcl(Elaboratable):
                     m.next = "AN_VISIT_RD"              # one literal, then back to the trail
                 with m.Else():
                     m.d.sync += [rsrc.eq(r_), rpos.eq(1)]
-                    m.d.comb += arena_r.addr.eq(r_[:AAW])
+                    m.d.comb += [arena_ra.eq(r_[:AAW]), arena_rq.eq(1)]
                     m.next = "AN_CL_HDR"
             # ------------------------------------------------------------ minimization (MiniSat's, recursive)
             # abstract levels of literals 1..
@@ -705,7 +733,7 @@ class Cdcl(Elaboratable):
                     m.d.sync += vq.eq(r_[:LB])
                     m.next = "RED_Q_RD"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(r_[:AAW])
+                    m.d.comb += [arena_ra.eq(r_[:AAW]), arena_rq.eq(1)]
                     m.next = "RED_CL_HDR"
             with m.State("RED_CL_HDR"):
                 m.d.sync += rsize.eq(arena_r.data[:SZW])
@@ -714,7 +742,7 @@ class Cdcl(Elaboratable):
                 with m.If(rpos == rsize):
                     m.next = "RED_POP"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(rsrc[:AAW] + 2 + rpos)
+                    m.d.comb += [arena_ra.eq(rsrc[:AAW] + 2 + rpos), arena_rq.eq(1)]
                     m.next = "RED_CL_LIT"
             with m.State("RED_CL_LIT"):
                 m.d.sync += [vq.eq(arena_r.data), rpos.eq(rpos + 1)]
@@ -1017,11 +1045,11 @@ class Cdcl(Elaboratable):
                     m.d.sync += [kill.eq(Mux(forced, ((ncand << 1) + ncand) >> 2, ncand >> 1)), acc.eq(0), thr.eq(255)]
                     m.next = "RD_TH_RD"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(rp)
+                    m.d.comb += [arena_ra.eq(rp), arena_rq.eq(1)]
                     m.next = "RD1_HDR"
             with m.State("RD1_HDR"):
                 m.d.sync += hsz.eq(arena_r.data[:SZW])
-                m.d.comb += arena_r.addr.eq(rp + 1)
+                m.d.comb += [arena_ra.eq(rp + 1), arena_rq.eq(1)]
                 m.next = "RD1_HDR2"
             candidate = lambda h: h[8] & ~(h[:8] <= 2) & ~((h[:8] <= 6) & h[9])
             with m.State("RD1_HDR2"):
@@ -1056,11 +1084,11 @@ class Cdcl(Elaboratable):
                     m.d.sync += [aptr.eq(wq), i.eq(0)]
                     m.next = "RD_WCLR"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(rp)
+                    m.d.comb += [arena_ra.eq(rp), arena_rq.eq(1)]
                     m.next = "RD2_HDR"
             with m.State("RD2_HDR"):
                 m.d.sync += hsz.eq(arena_r.data[:SZW])
-                m.d.comb += arena_r.addr.eq(rp + 1)
+                m.d.comb += [arena_ra.eq(rp + 1), arena_rq.eq(1)]
                 m.next = "RD2_HDR2"
             with m.State("RD2_HDR2"):
                 h = arena_r.data
@@ -1084,7 +1112,7 @@ class Cdcl(Elaboratable):
                     m.d.sync += [rp.eq(rp + 2 + hsz), wq.eq(wq + 2 + hsz)]
                     m.next = "RD2_RD"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(rp + 2 + cpos)
+                    m.d.comb += [arena_ra.eq(rp + 2 + cpos), arena_rq.eq(1)]
                     m.next = "RD2_CP"
             with m.State("RD2_CP"):
                 m.d.comb += [arena_w.addr.eq(wq + 2 + cpos), arena_w.data.eq(arena_r.data), arena_w.en.eq(1)]
@@ -1108,15 +1136,15 @@ class Cdcl(Elaboratable):
                     with m.Else():
                         m.next = "PROP"
                 with m.Else():
-                    m.d.comb += arena_r.addr.eq(rp)
+                    m.d.comb += [arena_ra.eq(rp), arena_rq.eq(1)]
                     m.next = "RD3_HDR"
             with m.State("RD3_HDR"):
                 m.d.sync += [hsz.eq(arena_r.data[:SZW]), cref.eq(rp)]
-                m.d.comb += arena_r.addr.eq(rp + 2)
+                m.d.comb += [arena_ra.eq(rp + 2), arena_rq.eq(1)]
                 m.next = "RD3_L0"
             with m.State("RD3_L0"):
                 m.d.sync += lit.eq(arena_r.data)
-                m.d.comb += arena_r.addr.eq(rp + 3)
+                m.d.comb += [arena_ra.eq(rp + 3), arena_rq.eq(1)]
                 m.next = "RD3_L1"
             with m.State("RD3_L1"):
                 m.d.sync += [klit.eq(arena_r.data), i.eq(0), rp.eq(rp + 2 + hsz)]
